@@ -58,25 +58,26 @@ app.post('/api/generate-test', async (req, res) => {
     while (remainingQuestions > 0) {
       const currentChunkSize = Math.min(MAX_CHUNK_SIZE, remainingQuestions);
       
-      // Ek chota sa random seed peeche lga rhenge taaki AI ka mood har request mein fresh rahe
       const sessionSeed = Math.random().toString(36).substring(7);
       let prompt = "";
 
       if (qType === 'Objective') {
-        prompt = `Gen ${currentChunkSize} MCQs for ${targetExam}. Topic: "${topic}". Lang: ${lang}. Diff: ${diffLevel}. Seed: ${sessionSeed}
-        [DEPTH]: Comprehensively cover the entire sub-topics, basic concepts, theorems, equations, and advanced numerical/logical variants of "${topic}". No repetitions.
-        [TYPOGRAPHY]: DO NOT use LaTeX ($ or \\) or raw keyboard laziness (^, _, *, brackets for limits). Use human-readable text with native UNICODE characters. Write actual superscripts (A³, x²), subscripts (λ₁, x₂), Greek letters (λ, θ, π, α, β), and signs (∫, ∂, ±, ∞). Present integrals cleanly as plain text: "Evaluate the integral of [function] from [limit a] to [limit b]".
-        [STRUCTURE]: For multi-statement or list-based questions, do NOT lump text into a single paragraph. Use explicit dual newlines (\\n\\n) to break lines, numbered points, or listed conditions cleanly so they render on separate lines.
-        [OPTIONS]: Distribute 'correctOptionIndex' randomly across 0,1,2,3 to eliminate bias.
+        prompt = `Gen ${currentChunkSize} MCQs for ${targetExam}. Topic: "${topic}". Lang: ${lang}. Seed: ${sessionSeed}
+        [DEPTH]: Cover all core concepts, theorems, equations, and advanced numerical variants of "${topic}". No repetitions.
+        [LATEX FORMATTING]: Wrap ALL mathematical expressions, equations, formulas, variables, subscripts (e.g., $\\lambda_1$), superscripts (e.g., $x^2$), fractions, integrals, and Greek symbols strictly inside inline LaTeX using single dollar signs ($...$). Never use plain English descriptive phrases like "power of x is 2".
+        [DIFFICULTY CALIBRATION]: Strict Enforcement for "${diffLevel}" level. If difficulty is "Medium", it must strictly match the actual standard core papers of ${targetExam}—make it highly conceptual, analytical, and tricky (ABSOLUTELY NO basic or direct textbook questions). If difficulty is "Tough", make it brutally advanced, elite research-level, requiring multi-layered calculation and complex logic.
+        [STRUCTURE]: For multi-statement, matching, or list-based questions, do NOT lump statements into one paragraph. You MUST format statements as a clean numbered vertical list (e.g., "Consider the following statements:\\n\\n1. [Statement 1]\\n\\n2. [Statement 2]") with explicit double escaped newlines (\\n\\n) after each item so the frontend renders them beautifully.
+        [OPTIONS]: Distribute 'correctOptionIndex' randomly across 0,1,2,3.
         JSON schema: {"questions": [{"id":0,"question":"","options":["","","",""],"correctOptionIndex":0,"explanation":""}]}.
-        Explanation: Max 20 words direct core fact.`;
+        Explanation: Max 20 words core fact wrapped in LaTeX where needed.`;
       } else {
-        prompt = `Gen ${currentChunkSize} descriptive questions for ${targetExam}. Topic: "${topic}". Lang: ${lang}. Diff: ${diffLevel}. Seed: ${sessionSeed}
-        [DEPTH]: Target thorough syllabus mapping of "${topic}" matching a real professional descriptive examination challenge sheet.
-        [TYPOGRAPHY]: DO NOT use LaTeX ($ or \\) or lazy typing symbols (^, _, *). Use pure text containing native browser-supported UNICODE formatting for exponents (x³, y²), subscripts (C₁, C₂), and operators (∫, ∂, ±, ∞, λ, θ, π). Integrals must look like: "Find the integral of [function] within boundaries [a] and [b]".
-        [STRUCTURE]: Break long scenarios, context data, or multiple directives using clear escaped dual line-breaks (\\n\\n) instead of clumping.
+        prompt = `Gen ${currentChunkSize} descriptive questions for ${targetExam}. Topic: "${topic}". Lang: ${lang}. Seed: ${sessionSeed}
+        [DEPTH]: Deep syllabus mapping of "${topic}" matching a professional descriptive exam paper.
+        [LATEX FORMATTING]: Wrap all scientific and mathematical equations, formulas, variables, bounds, powers, and indices strictly inside inline LaTeX using single dollar signs ($...$).
+        [DIFFICULTY CALIBRATION]: Strict Enforcement for "${diffLevel}" level. If difficulty is "Medium", make it deeply conceptual and matching real exam standards. If "Tough", make it highly complex and multi-layered.
+        [STRUCTURE]: Use explicit double newlines (\\n\\n) to break long problem scenarios, statements, or multi-part directives cleanly into vertical lists or separate paragraphs instead of clumping.
         JSON schema: {"questions": [{"id":0,"question":"","explanation":""}]}.
-        Explanation: Max 35 words strict core valuation framework points.`;
+        Explanation: Max 35 words core grading framework points.`;
       }
 
       let retries = 3;
