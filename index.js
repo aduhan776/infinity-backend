@@ -63,19 +63,18 @@ app.post('/api/generate-test', async (req, res) => {
       let prompt = "";
 
       if (qType === 'Objective') {
-        prompt = `Gen ${currentChunkSize} MCQs for ${targetExam}. Topic: "${topic}". Lang: ${lang}. Seed: ${sessionSeed}
-        [STRICT VARIETY]: Ensure high diversity in question angles. Do not repeat core formulas or exact phrasings within this batch.
-        [ORIGINALITY]: Mix standard exam patterns with completely unique, self-crafted application-based problem variants. Alter numerical weights and scenarios from scratch. No verbatim internet question-bank copying.
-        [DIFFICULTY CALIBRATION]: Level is ${diffLevel}. Strict rule: Medium must be intermediate, Tough must be highly advanced/hard. Do not down-scale.
-        [OPTION RANDOMIZATION]: Distribute 'correctOptionIndex' 100% equally/randomly across 0,1,2,3 to eliminate bias toward options B or C.
-        [PRECISION]: Lasersharp focus on topic. No broad or generic fluff.
+        prompt = `Gen ${currentChunkSize} MCQs for ${targetExam}. Topic: "${topic}". Lang: ${lang}. Diff: ${diffLevel}. Seed: ${sessionSeed}
+        [DEPTH]: Comprehensively cover the entire sub-topics, basic concepts, theorems, equations, and advanced numerical/logical variants of "${topic}". No repetitions.
+        [TYPOGRAPHY]: DO NOT use LaTeX ($ or \\) or raw keyboard laziness (^, _, *, brackets for limits). Use human-readable text with native UNICODE characters. Write actual superscripts (A³, x²), subscripts (λ₁, x₂), Greek letters (λ, θ, π, α, β), and signs (∫, ∂, ±, ∞). Present integrals cleanly as plain text: "Evaluate the integral of [function] from [limit a] to [limit b]".
+        [STRUCTURE]: For multi-statement or list-based questions, do NOT lump text into a single paragraph. Use explicit dual newlines (\\n\\n) to break lines, numbered points, or listed conditions cleanly so they render on separate lines.
+        [OPTIONS]: Distribute 'correctOptionIndex' randomly across 0,1,2,3 to eliminate bias.
         JSON schema: {"questions": [{"id":0,"question":"","options":["","","",""],"correctOptionIndex":0,"explanation":""}]}.
         Explanation: Max 20 words direct core fact.`;
       } else {
-        prompt = `Gen ${currentChunkSize} analytical descriptive questions for ${targetExam}. Topic: "${topic}". Lang: ${lang}. Seed: ${sessionSeed}
-        [ORIGINALITY]: Create completely unique, self-crafted descriptive problem statements or deep situational scenarios from scratch instead of cliché preloaded questions.
-        [DIFFICULTY CALIBRATION]: Level is ${diffLevel}. Strict rule: Medium must be intermediate, Tough must be highly advanced/hard. Do not down-scale.
-        [PRECISION]: Lasersharp focus on topic. No generic talk.
+        prompt = `Gen ${currentChunkSize} descriptive questions for ${targetExam}. Topic: "${topic}". Lang: ${lang}. Diff: ${diffLevel}. Seed: ${sessionSeed}
+        [DEPTH]: Target thorough syllabus mapping of "${topic}" matching a real professional descriptive examination challenge sheet.
+        [TYPOGRAPHY]: DO NOT use LaTeX ($ or \\) or lazy typing symbols (^, _, *). Use pure text containing native browser-supported UNICODE formatting for exponents (x³, y²), subscripts (C₁, C₂), and operators (∫, ∂, ±, ∞, λ, θ, π). Integrals must look like: "Find the integral of [function] within boundaries [a] and [b]".
+        [STRUCTURE]: Break long scenarios, context data, or multiple directives using clear escaped dual line-breaks (\\n\\n) instead of clumping.
         JSON schema: {"questions": [{"id":0,"question":"","explanation":""}]}.
         Explanation: Max 35 words strict core valuation framework points.`;
       }
