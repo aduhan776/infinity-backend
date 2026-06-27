@@ -62,19 +62,36 @@ app.post('/api/generate-test', async (req, res) => {
       let prompt = "";
 
       if (qType === 'Objective') {
-        prompt = `Gen ${currentChunkSize} MCQs for ${targetExam}. Topic: "${topic}". Lang: ${lang}. Seed: ${sessionSeed}
-        [DEPTH]: Cover all core concepts, theorems, equations, and advanced numerical variants of "${topic}". No repetitions.
-        [LATEX FORMATTING]: Wrap ALL mathematical expressions, equations, formulas, variables, subscripts (e.g., $\\lambda_1$), superscripts (e.g., $x^2$), fractions, integrals, and Greek symbols strictly inside inline LaTeX using single dollar signs ($...$). Never use plain English descriptive phrases like "power of x is 2".
-        [DIFFICULTY CALIBRATION]: Strict Enforcement for "${diffLevel}" level. If difficulty is "Medium", it must strictly match the actual standard core papers of ${targetExam}—make it highly conceptual, analytical, and tricky (ABSOLUTELY NO basic or direct textbook questions). If difficulty is "Tough", make it brutally advanced, elite research-level, requiring multi-layered calculation and complex logic.
+        prompt = `Generate EXACTLY ${currentChunkSize} unique Multiple Choice Questions (MCQs) for ${targetExam}. Topic: "${topic}". Lang: ${lang}. Seed: ${sessionSeed}
+        
+        [STRICT COUNT CONSTRAINT]: Your JSON response array MUST contain exactly ${currentChunkSize} question objects inside the "questions" array. Absolutely do not generate more than or less than ${currentChunkSize} questions.
+        
+        [TARGET EXAM & TOPIC ADAPTATION]: CRITICAL RULE! Align questions precisely with the syllabus profile of ${targetExam}. 
+        - For Humanities, General Studies, and Conceptual topics (e.g., Geography, History, Indian Polity, General Economics, Ecology): Focus 100% on conceptual clarity, physical mechanisms, features, analytical relationships, and statements. ABSOLUTELY DO NOT invent or force complex mathematical formulas, derivatives, fluid mechanics calculations, or quantitative equations into these questions. Keep it purely aligned to standard GS papers.
+        - For Naturally Technical/Quantitative topics (e.g., Pure Mathematics, Physics numericals, Quantitative Chemistry): You are expected to include appropriate formula applications and multi-layered calculations.
+        
+        [LATEX FORMATTING]: ONLY if mathematical expressions, core variables, formulas, subscripts (e.g., $\\lambda_1$), or superscripts (e.g., $x^2$) are naturally and legitimately required for the topic, wrap them strictly inside inline LaTeX using single dollar signs ($...$). Do NOT artificially force math symbols or LaTeX notation into strictly conceptual humanities/geography text.
+        
+        [DIFFICULTY CALIBRATION]: Strict Enforcement for "${diffLevel}" level. If difficulty is "Medium", it must strictly match the actual standard core papers of ${targetExam}—make it highly conceptual, analytical, and tricky (ABSOLUTELY NO basic or direct textbook questions). If difficulty is "Tough", make it brutally advanced, elite level, requiring complex structural logic.
+        
         [STRUCTURE]: For multi-statement, matching, or list-based questions, do NOT lump statements into one paragraph. You MUST format statements as a clean numbered vertical list (e.g., "Consider the following statements:\\n\\n1. [Statement 1]\\n\\n2. [Statement 2]") with explicit double escaped newlines (\\n\\n) after each item so the frontend renders them beautifully.
+        
         [OPTIONS]: Distribute 'correctOptionIndex' randomly across 0,1,2,3.
         JSON schema: {"questions": [{"id":0,"question":"","options":["","","",""],"correctOptionIndex":0,"explanation":""}]}.
         Explanation: Max 20 words core fact wrapped in LaTeX where needed.`;
       } else {
-        prompt = `Gen ${currentChunkSize} descriptive questions for ${targetExam}. Topic: "${topic}". Lang: ${lang}. Seed: ${sessionSeed}
-        [DEPTH]: Deep syllabus mapping of "${topic}" matching a professional descriptive exam paper.
-        [LATEX FORMATTING]: Wrap all scientific and mathematical equations, formulas, variables, bounds, powers, and indices strictly inside inline LaTeX using single dollar signs ($...$).
+        prompt = `Generate EXACTLY ${currentChunkSize} distinct descriptive/subjective questions for ${targetExam}. Topic: "${topic}". Lang: ${lang}. Seed: ${sessionSeed}
+        
+        [STRICT COUNT CONSTRAINT]: Your JSON response array MUST contain exactly ${currentChunkSize} question object(s) inside the "questions" array. If the requested count is 1, generate exactly 1 question. If the requested count is 2, generate exactly 2 questions. Do NOT default to 3 or any other number under any circumstances. Strict compliance is mandatory.
+        
+        [TARGET EXAM & TOPIC ADAPTATION]: CRITICAL RULE! Align the descriptive question precisely with the requirements of ${targetExam} mains/written papers.
+        - For General Studies/Humanities topics (like Geography, Polity, History, etc.): Ask for analytical evaluation, critical discussions, administrative impacts, or geographical causes. ABSOLUTELY DO NOT force mathematical equations, formulas, or mechanical/computational problems into conceptual topics.
+        - For Technical papers (like Physics, Mathematics): Focus on derivations and core quantitative problems.
+        
+        [LATEX FORMATTING]: ONLY if scientific/mathematical formulas, variables, bounds, or indices are naturally present, wrap them strictly inside inline LaTeX using single dollar signs ($...$). Do NOT invent math formulas for non-mathematical conceptual topics.
+        
         [DIFFICULTY CALIBRATION]: Strict Enforcement for "${diffLevel}" level. If difficulty is "Medium", make it deeply conceptual and matching real exam standards. If "Tough", make it highly complex and multi-layered.
+        
         [STRUCTURE]: Use explicit double newlines (\\n\\n) to break long problem scenarios, statements, or multi-part directives cleanly into vertical lists or separate paragraphs instead of clumping.
         JSON schema: {"questions": [{"id":0,"question":"","explanation":""}]}.
         Explanation: Max 35 words core grading framework points.`;
@@ -101,7 +118,14 @@ app.post('/api/generate-test', async (req, res) => {
       const jsonMatch = responseText.match(/\{[\s\S]*\}/);
       if (!jsonMatch) throw new Error("Invalid AI JSON stream layer returned.");
 
-      const parsedData = JSON.parse(jsonMatch[0]);
+      const rawJsonText = jsonMatch[0];
+      
+      // 🎯 THE ULTIMATE BULLETPROOF LATEX-JSON AUTO-CLEANER REGEX:
+      // Yeh line JSON parse hone se pehle saare single LaTeX backslashes ko auto double backslash (\\\\) bana degi.
+      // Iske baad 'Bad escaped character' parsing block errors hamesha ke liye khatam!
+      const cleanJsonString = rawJsonText.replace(/\\(?!["\\\/bfnrtu])/g, '\\\\');
+
+      const parsedData = JSON.parse(cleanJsonString);
       if (parsedData.questions && Array.isArray(parsedData.questions)) {
         allCompiledQuestions = [...allCompiledQuestions, ...parsedData.questions];
       }
