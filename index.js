@@ -5,12 +5,30 @@ import { GoogleGenerativeAI } from '@google/generative-ai';
 
 dotenv.config();
 
+// 🚨 1. FAIL-FAST STARTUP LAYER
+if (!process.env.GEMINI_API_KEY) {
+  console.error("❌ CRITICAL BOOT FAILURE: GEMINI_API_KEY environment variable is missing inside backend .env file!");
+  process.exit(1);
+}
+
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-app.use(cors());
-app.use(express.json({ limit: '50mb' }));
-app.use(express.urlencoded({ limit: '50mb', extended: true }));
+// 🔒 2. HARDENED CORS SECURITY POLICY
+const allowedOrigins = process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGINS.split(',') : ['http://localhost:5173'];
+app.use(cors({
+  origin: (origin, callback) => {
+    if (!origin || allowedOrigins.indexOf(origin) !== -1) {
+      callback(null, true);
+    } else {
+      callback(new Error('Access blocked by Infinity Security Framework Gateway (CORS Violation).'));
+    }
+  }
+}));
+
+// Reduced payload window safely from 50mb to 15mb to prevent malicious DoS memory utilization overheads
+app.use(express.json({ limit: '15mb' }));
+app.use(express.urlencoded({ limit: '15mb', extended: true }));
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
@@ -26,19 +44,23 @@ function makeGenerativePart(base64DataUrl) {
 }
 
 app.get('/', (req, res) => {
-  res.send('Infinity Bulletproof Engine with Auto-Retry Layer Live! ⚡🚀');
+  res.send('Infinity Airtight Production Engine Live! ⚡🚀');
 });
 
-// ==========================================
-// 🎯 ROUTE 1: CLEAN & HIGH-VARIETY TEST GENERATION ENGINE
-// ==========================================
+// ======================================================================
+// 🎯 ROUTE 1: CLEAN & HIGH-VARIETY TEST GENERATION ENGINE (Hardened)
+// ======================================================================
 app.post('/api/generate-test', async (req, res) => {
   try {
     const { exam, topic, count, type, difficulty, language } = req.body;
 
     if (!topic) return res.status(400).json({ error: "Topic missing bhai!" });
 
-    const totalRequested = parseInt(count) || 5;
+    // 🚨 3. SERVER SIDE QUESTION COUNT BOUNDS CONSTRAINT
+    // Max clamp 50 taaki CPO Tier-2 ke sequential frontend loops bina kisi memory pressure ke perfectly pass hon
+    const rawRequested = parseInt(count) || 5;
+    const totalRequested = Math.min(50, Math.max(3, rawRequested)); 
+
     const targetExam = exam || "Competitive Exam";
     const qType = type || "Objective";
     const diffLevel = difficulty || "Medium";
@@ -53,11 +75,10 @@ app.post('/api/generate-test', async (req, res) => {
     let allCompiledQuestions = [];
     let remainingQuestions = totalRequested;
 
-    console.log(`🚀 Starting Safe Pipeline: Requested ${totalRequested} Qs for topic "${topic}"`);
+    console.log(`🚀 Pipeline Active: Processing requested ${totalRequested} Qs safely for topic "${topic}"`);
 
     while (remainingQuestions > 0) {
       const currentChunkSize = Math.min(MAX_CHUNK_SIZE, remainingQuestions);
-      
       const sessionSeed = Math.random().toString(36).substring(7);
       let prompt = "";
 
@@ -82,7 +103,7 @@ app.post('/api/generate-test', async (req, res) => {
       } else {
         prompt = `Generate EXACTLY ${currentChunkSize} distinct descriptive/subjective questions for ${targetExam}. Topic: "${topic}". Lang: ${lang}. Seed: ${sessionSeed}
         
-        [STRICT COUNT CONSTRAINT]: Your JSON response array MUST contain exactly ${currentChunkSize} question object(s) inside the "questions" array. If the requested count is 1, generate exactly 1 question. If the requested count is 2, generate exactly 2 questions. Do NOT default to 3 or any other number under any circumstances. Strict compliance is mandatory.
+        [STRICT COUNT CONSTRAINT]: Your JSON response array MUST contain exactly ${currentChunkSize} question object(s) inside the "questions" array. If the requested count is 3, generate exactly 3 questions. Strict compliance is mandatory.
         
         [TARGET EXAM & TOPIC ADAPTATION]: CRITICAL RULE! Align the descriptive question precisely with the requirements of ${targetExam} mains/written papers.
         - For General Studies/Humanities topics (like Geography, Polity, History, etc.): Ask for analytical evaluation, critical discussions, administrative impacts, or geographical causes. ABSOLUTELY DO NOT force mathematical equations, formulas, or mechanical/computational problems into conceptual topics.
@@ -102,27 +123,26 @@ app.post('/api/generate-test', async (req, res) => {
       
       while (retries > 0) {
         try {
-          console.log(`📦 Requesting batch of ${currentChunkSize} questions... (Attempts left: ${retries})`);
           const result = await model.generateContent(prompt);
           const response = await result.response;
           responseText = response.text();
           break; 
         } catch (apiError) {
           retries--;
-          console.warn(`⚠️ Google Server high demand spike hit. Retrying in 2 seconds...`);
+          console.warn(`⚠️ High server demand spike hit generator node. Retrying in 2 seconds...`);
           if (retries === 0) throw apiError; 
           await new Promise(resolve => setTimeout(resolve, 2000)); 
         }
       }
 
-      const jsonMatch = responseText.match(/\{[\s\S]*\}/);
-      if (!jsonMatch) throw new Error("Invalid AI JSON stream layer returned.");
-
-      const rawJsonText = jsonMatch[0];
+      // 🚨 4. ROBUST STRIPPED JSON CONTEXT EXTRACTION LAYER (Bypasses Greedy Regex Failures)
+      const startBrace = responseText.indexOf('{');
+      const endBrace = responseText.lastIndexOf('}');
+      if (startBrace === -1 || endBrace === -1) throw new Error("Invalid structured AI text response mapping stream.");
+      const rawJsonText = responseText.substring(startBrace, endBrace + 1);
       
-      // 🎯 THE ULTIMATE BULLETPROOF LATEX-JSON AUTO-CLEANER REGEX:
-      // Yeh line JSON parse hone se pehle saare single LaTeX backslashes ko auto double backslash (\\\\) bana degi.
-      // Iske baad 'Bad escaped character' parsing block errors hamesha ke liye khatam!
+      // 🚨 5. REFINED LATEX-JSON AUTO CLEANER LOOKAHEAD REGEX
+      // Sirf LaTeX ke single backslashes ko double escape (\\\\) karega, native JSON control chars (\n, \") ko nahi chedega!
       const cleanJsonString = rawJsonText.replace(/\\(?!["\\\/bfnrtu])/g, '\\\\');
 
       const parsedData = JSON.parse(cleanJsonString);
@@ -133,7 +153,7 @@ app.post('/api/generate-test', async (req, res) => {
       remainingQuestions -= currentChunkSize;
     }
 
-    const finalIndexedQuestions = allCompiledQuestions.map((q, index) => ({
+    const finalIndexedQuestions = allCompiledQuestions.slice(0, totalRequested).map((q, index) => ({
       ...q,
       id: index
     }));
@@ -236,15 +256,28 @@ app.post('/api/evaluate-subjective', async (req, res) => {
       }
     }
 
-    const cleanJsonMatch = evaluationResultText.match(/\{[\s\S]*\}/);
-    if (!cleanJsonMatch) throw new Error("Evaluation Engine failed to output a reliable structured matrix response.");
+    const startBrace = evaluationResultText.indexOf('{');
+    const endBrace = evaluationResultText.lastIndexOf('}');
+    if (startBrace === -1 || endBrace === -1) throw new Error("Evaluation Engine failed to output a reliable structured matrix response.");
 
-    const finalEvaluatedPayload = JSON.parse(cleanJsonMatch[0]);
-    console.log(`✅ Subjective Evaluation Complete! Core Score Compiled: ${finalEvaluatedPayload.score_given}/${parsedMaxMarks}`);
+    const finalEvaluatedPayload = JSON.parse(evaluationResultText.substring(startBrace, endBrace + 1));
+    
+    // 🚨 6. STRICT SCORE VALIDATION & BOUNDARY CLAMP SECURITY GATEWAY
+    let scoreGiven = parseFloat(finalEvaluatedPayload.score_given);
+    if (isNaN(scoreGiven)) scoreGiven = 0.0;
+    scoreGiven = Math.min(parsedMaxMarks, Math.max(0.0, scoreGiven)); // Hard clamp validation fence
+
+    console.log(`✅ Subjective Evaluation Complete! Core Score Compiled: ${scoreGiven}/${parsedMaxMarks}`);
 
     res.json({
       success: true,
-      evaluation: finalEvaluatedPayload
+      evaluation: {
+        score_given: scoreGiven,
+        ai_evaluation: {
+          student_points: finalEvaluatedPayload.ai_evaluation?.student_points || ["Points evaluated contextually."],
+          scope_of_improvement: finalEvaluatedPayload.ai_evaluation?.scope_of_improvement || "Refine formatting matrices layouts."
+        }
+      }
     });
 
   } catch (error) {
@@ -256,4 +289,4 @@ app.post('/api/evaluate-subjective', async (req, res) => {
   }
 });
 
-app.listen(PORT, () => console.log(`🔥 Server active on port: ${PORT}`));
+app.listen(PORT, () => console.log(`🔥 Production Secure Server running active on port: ${PORT}`));
