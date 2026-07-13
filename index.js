@@ -57,7 +57,6 @@ app.post('/api/generate-test', async (req, res) => {
     if (!topic) return res.status(400).json({ error: "Topic missing bhai!" });
 
     // 🚨 3. SERVER SIDE QUESTION COUNT BOUNDS CONSTRAINT
-    // Max clamp 50 taaki CPO Tier-2 ke sequential frontend loops bina kisi memory pressure ke perfectly pass hon
     const rawRequested = parseInt(count) || 5;
     const totalRequested = Math.min(50, Math.max(3, rawRequested)); 
 
@@ -135,15 +134,33 @@ app.post('/api/generate-test', async (req, res) => {
         }
       }
 
-      // 🚨 4. ROBUST STRIPPED JSON CONTEXT EXTRACTION LAYER (Bypasses Greedy Regex Failures)
+      // 🚨 4. ROBUST STRIPPED JSON CONTEXT EXTRACTION LAYER
       const startBrace = responseText.indexOf('{');
       const endBrace = responseText.lastIndexOf('}');
       if (startBrace === -1 || endBrace === -1) throw new Error("Invalid structured AI text response mapping stream.");
       const rawJsonText = responseText.substring(startBrace, endBrace + 1);
       
-      // 🚨 5. REFINED LATEX-JSON AUTO CLEANER LOOKAHEAD REGEX
-      // Sirf LaTeX ke single backslashes ko double escape (\\\\) karega, native JSON control chars (\n, \") ko nahi chedega!
-      const cleanJsonString = rawJsonText.replace(/\\(?!["\\\/bfnrtu])/g, '\\\\');
+      // 🚨 5. FIXED ONE-SHOT STRUCTURAL TOKENIZER SCANNER
+      let cleanJsonString = "";
+      let isInsideStringValue = false;
+      
+      for (let i = 0; i < rawJsonText.length; i++) {
+        let char = rawJsonText[i];
+        if (char === '"' && rawJsonText[i - 1] !== '\\') {
+          isInsideStringValue = !isInsideStringValue;
+          cleanJsonString += char;
+        } else if (isInsideStringValue && char === '\\') {
+          let nextChar = rawJsonText[i + 1];
+          if (nextChar === '"' || nextChar === '\\' || nextChar === 'n' || nextChar === 't' || nextChar === 'r') {
+            cleanJsonString += '\\' + nextChar;
+            i++; 
+          } else {
+            cleanJsonString += '\\\\';
+          }
+        } else {
+          cleanJsonString += char;
+        }
+      }
 
       const parsedData = JSON.parse(cleanJsonString);
       if (parsedData.questions && Array.isArray(parsedData.questions)) {
