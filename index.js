@@ -117,53 +117,40 @@ app.post('/api/generate-test', async (req, res) => {
         Explanation: Max 35 words core grading framework points.`;
       }
 
+      // 🚨 4. UNIFIED RETRY LOOP: retries on BOTH API failures AND JSON parse failures.
+      // Gemini is already in JSON mode (responseMimeType: "application/json"), so its raw
+      // output is valid JSON — no manual "repair" scanner is needed or safe to use, since
+      // such scanners can't reliably tell a real JSON escape (\n, \t, \r) apart from a
+      // LaTeX command that happens to start with the same letter (\nu, \tau, \rho, etc.).
+      // If parsing genuinely fails, we just ask Gemini again rather than trying to patch it.
       let retries = 3;
-      let responseText = "";
-      
+      let parsedData = null;
+
       while (retries > 0) {
+        let responseText = "";
         try {
           const result = await model.generateContent(prompt);
           const response = await result.response;
           responseText = response.text();
-          break; 
-        } catch (apiError) {
-          retries--;
-          console.warn(`⚠️ High server demand spike hit generator node. Retrying in 2 seconds...`);
-          if (retries === 0) throw apiError; 
-          await new Promise(resolve => setTimeout(resolve, 2000)); 
-        }
-      }
 
-      // 🚨 4. ROBUST STRIPPED JSON CONTEXT EXTRACTION LAYER
-      const startBrace = responseText.indexOf('{');
-      const endBrace = responseText.lastIndexOf('}');
-      if (startBrace === -1 || endBrace === -1) throw new Error("Invalid structured AI text response mapping stream.");
-      const rawJsonText = responseText.substring(startBrace, endBrace + 1);
-      
-      // 🚨 5. FIXED ONE-SHOT STRUCTURAL TOKENIZER SCANNER
-      let cleanJsonString = "";
-      let isInsideStringValue = false;
-      
-      for (let i = 0; i < rawJsonText.length; i++) {
-        let char = rawJsonText[i];
-        if (char === '"' && rawJsonText[i - 1] !== '\\') {
-          isInsideStringValue = !isInsideStringValue;
-          cleanJsonString += char;
-        } else if (isInsideStringValue && char === '\\') {
-          let nextChar = rawJsonText[i + 1];
-          if (nextChar === '"' || nextChar === '\\' || nextChar === 'n' || nextChar === 't' || nextChar === 'r') {
-            cleanJsonString += '\\' + nextChar;
-            i++; 
-          } else {
-            cleanJsonString += '\\\\';
+          const startBrace = responseText.indexOf('{');
+          const endBrace = responseText.lastIndexOf('}');
+          if (startBrace === -1 || endBrace === -1) {
+            throw new Error("Invalid structured AI text response mapping stream.");
           }
-        } else {
-          cleanJsonString += char;
+          const rawJsonText = responseText.substring(startBrace, endBrace + 1);
+
+          parsedData = JSON.parse(rawJsonText);
+          break; // success — exit retry loop
+        } catch (err) {
+          retries--;
+          console.warn(`⚠️ Generation/parse issue hit generator node (${err.message}). Retrying...`);
+          if (retries === 0) throw err;
+          await new Promise(resolve => setTimeout(resolve, 2000));
         }
       }
 
-      const parsedData = JSON.parse(cleanJsonString);
-      if (parsedData.questions && Array.isArray(parsedData.questions)) {
+      if (parsedData && parsedData.questions && Array.isArray(parsedData.questions)) {
         allCompiledQuestions = [...allCompiledQuestions, ...parsedData.questions];
       }
 
