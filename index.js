@@ -67,7 +67,12 @@ app.post('/api/generate-test', async (req, res) => {
 
     const model = genAI.getGenerativeModel({ 
       model: "gemini-3.1-flash-lite",
-      generationConfig: { responseMimeType: "application/json" }
+      // 🎲 temperature raised from the model's default toward its upper range to
+      // meaningfully increase question variety between separate generation calls
+      // on the same topic — this alone won't guarantee zero repeats (that needs
+      // an actual exclusion-list mechanism), but reduces how often the model
+      // clusters around the same "most likely" questions for a narrow topic.
+      generationConfig: { responseMimeType: "application/json", temperature: 1.3 }
     });
 
     const MAX_CHUNK_SIZE = 15;
