@@ -52,15 +52,19 @@ app.get('/', (req, res) => {
 // ======================================================================
 app.post('/api/generate-test', async (req, res) => {
   try {
-    const { exam, topic, count, type, difficulty, language } = req.body;
+    const { exam, subject, topic, count, type, difficulty, language } = req.body;
 
-    if (!topic) return res.status(400).json({ error: "Topic missing bhai!" });
+    if (!subject) return res.status(400).json({ error: "Subject / Section missing bhai!" });
 
     // 🚨 3. SERVER SIDE QUESTION COUNT BOUNDS CONSTRAINT
     const rawRequested = parseInt(count) || 5;
     const totalRequested = Math.min(50, Math.max(3, rawRequested)); 
 
     const targetExam = exam || "Competitive Exam";
+    const targetSubject = subject;
+    const topicFocusPhrase = topic && topic.trim()
+      ? `Specific Topic Focus: "${topic}".`
+      : `No specific narrow topic given — cover general questions broadly across this subject/section.`;
     const qType = type || "Objective";
     const diffLevel = difficulty || "Medium";
     const lang = language || "English";
@@ -79,7 +83,7 @@ app.post('/api/generate-test', async (req, res) => {
     let allCompiledQuestions = [];
     let remainingQuestions = totalRequested;
 
-    console.log(`🚀 Pipeline Active: Processing requested ${totalRequested} Qs safely for topic "${topic}"`);
+    console.log(`🚀 Pipeline Active: Processing requested ${totalRequested} Qs safely for subject "${targetSubject}"${topic ? ` (topic: "${topic}")` : ''}`);
 
     while (remainingQuestions > 0) {
       const currentChunkSize = Math.min(MAX_CHUNK_SIZE, remainingQuestions);
@@ -87,7 +91,7 @@ app.post('/api/generate-test', async (req, res) => {
       let prompt = "";
 
       if (qType === 'Objective') {
-        prompt = `Generate EXACTLY ${currentChunkSize} unique Multiple Choice Questions (MCQs) for ${targetExam}. Topic: "${topic}". Lang: ${lang}. Seed: ${sessionSeed}
+        prompt = `Generate EXACTLY ${currentChunkSize} unique Multiple Choice Questions (MCQs) for ${targetExam}. Subject/Section: "${targetSubject}". ${topicFocusPhrase} Lang: ${lang}. Seed: ${sessionSeed}
         
         [STRICT COUNT CONSTRAINT]: Your JSON response array MUST contain exactly ${currentChunkSize} question objects inside the "questions" array. Absolutely do not generate more than or less than ${currentChunkSize} questions.
         
@@ -105,7 +109,7 @@ app.post('/api/generate-test', async (req, res) => {
         JSON schema: {"questions": [{"id":0,"question":"","options":["","","",""],"correctOptionIndex":0,"explanation":""}]}.
         Explanation: Max 20 words core fact wrapped in LaTeX where needed.`;
       } else {
-        prompt = `Generate EXACTLY ${currentChunkSize} distinct descriptive/subjective questions for ${targetExam}. Topic: "${topic}". Lang: ${lang}. Seed: ${sessionSeed}
+        prompt = `Generate EXACTLY ${currentChunkSize} distinct descriptive/subjective questions for ${targetExam}. Subject/Section: "${targetSubject}". ${topicFocusPhrase} Lang: ${lang}. Seed: ${sessionSeed}
         
         [STRICT COUNT CONSTRAINT]: Your JSON response array MUST contain exactly ${currentChunkSize} question object(s) inside the "questions" array. If the requested count is 3, generate exactly 3 questions. Strict compliance is mandatory.
         
@@ -171,7 +175,8 @@ app.post('/api/generate-test', async (req, res) => {
 
     res.json({
       success: true,
-      topic: topic,
+      subject: targetSubject,
+      topic: topic || null,
       questions: finalIndexedQuestions
     });
 
