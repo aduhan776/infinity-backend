@@ -349,6 +349,19 @@ app.post('/api/evaluate-subjective', async (req, res) => {
 // Used to catch a freshly generated question that's just a reworded
 // duplicate of something already in the pool for the same tag combo.
 // ======================================================================
+// ======================================================================
+// 🧠 HELPER: Normalize tag fields (exam, subject, topic) so the pool
+// treats "SSC CGL", "ssc cgl", and "SSC   CGL" as the exact same tag.
+// Postgres text equality is case-sensitive by default, so without this,
+// casing drift alone would silently fragment the pool and quietly bring
+// back the repetition/duplication problem this whole system exists to fix.
+// Only affects internal matching tags — never touches question text itself.
+// ======================================================================
+function normalizeTag(value) {
+  if (!value || typeof value !== 'string') return value;
+  return value.trim().replace(/\s+/g, ' ').toUpperCase();
+}
+
 function normalizeToWords(text) {
   return (text || "")
     .toLowerCase()
@@ -476,9 +489,9 @@ app.post('/api/pool/serve-questions', async (req, res) => {
     if (!studentId) return res.status(400).json({ success: false, error: "studentId missing bhai!" });
     if (!subject) return res.status(400).json({ success: false, error: "Subject/Section missing bhai!" });
 
-    const targetExam = exam || "Competitive Exam";
-    const targetSubject = subject;
-    const targetTopic = topic && topic.trim() ? topic.trim() : null;
+    const targetExam = normalizeTag(exam) || "COMPETITIVE EXAM";
+    const targetSubject = normalizeTag(subject);
+    const targetTopic = normalizeTag(topic) || null;
     const diffLevel = difficulty || "Medium";
     const qType = type || "Objective";
     const lang = language || "English";
@@ -717,9 +730,9 @@ app.post('/api/pool/build-test', async (req, res) => {
     if (!studentId) return res.status(400).json({ success: false, error: "studentId missing bhai!" });
     if (!subject) return res.status(400).json({ success: false, error: "Subject/Section missing bhai!" });
 
-    const targetExam = exam || "Competitive Exam";
-    const targetSubject = subject;
-    const targetTopic = topic && topic.trim() ? topic.trim() : null;
+    const targetExam = normalizeTag(exam) || "COMPETITIVE EXAM";
+    const targetSubject = normalizeTag(subject);
+    const targetTopic = normalizeTag(topic) || null;
     const diffLevel = difficulty || "Medium";
     const qType = type || "Objective";
     const lang = language || "English";
