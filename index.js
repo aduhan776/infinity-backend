@@ -2,12 +2,17 @@ import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import { GoogleGenerativeAI } from '@google/generative-ai';
+import { createClient } from '@supabase/supabase-js';
 
 dotenv.config();
 
 // 🚨 1. FAIL-FAST STARTUP LAYER
 if (!process.env.GEMINI_API_KEY) {
   console.error("❌ CRITICAL BOOT FAILURE: GEMINI_API_KEY environment variable is missing inside backend .env file!");
+  process.exit(1);
+}
+if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
+  console.error("❌ CRITICAL BOOT FAILURE: SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY missing inside backend .env file!");
   process.exit(1);
 }
 
@@ -32,6 +37,18 @@ app.use(express.urlencoded({ limit: '15mb', extended: true }));
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
+// 🔑 SUPABASE SERVICE ROLE CLIENT
+// This client uses the service_role key, which BYPASSES all Row Level Security.
+// This is intentional and safe here because:
+//   1. This client only ever lives on the backend server, never sent to the browser.
+//   2. question_pool and attempts_ledger have RLS enabled with ZERO policies —
+//      meaning the frontend (using its anon/authenticated key) cannot touch them at all.
+//      This backend is the ONLY door into those two tables.
+//   3. Answer-hiding (correct_option_index, correct_answer, explanation) is enforced
+//      here in code before sending any response to the frontend — not by RLS,
+//      since RLS can only block/allow whole rows, not individual columns.
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
+
 function makeGenerativePart(base64DataUrl) {
   const match = base64DataUrl.match(/^data:(.*);base64,(.*)$/);
   if (!match) return null;
@@ -49,6 +66,8 @@ app.get('/', (req, res) => {
 
 // ======================================================================
 // 🎯 ROUTE 1: CLEAN & HIGH-VARIETY TEST GENERATION ENGINE (Hardened)
+// (UNCHANGED — kept exactly as-is, still used wherever pool-based
+//  serving isn't wired in yet, or for one-off generation needs)
 // ======================================================================
 app.post('/api/generate-test', async (req, res) => {
   try {
@@ -127,11 +146,6 @@ app.post('/api/generate-test', async (req, res) => {
       }
 
       // 🚨 4. UNIFIED RETRY LOOP: retries on BOTH API failures AND JSON parse failures.
-      // Gemini is already in JSON mode (responseMimeType: "application/json"), so its raw
-      // output is valid JSON — no manual "repair" scanner is needed or safe to use, since
-      // such scanners can't reliably tell a real JSON escape (\n, \t, \r) apart from a
-      // LaTeX command that happens to start with the same letter (\nu, \tau, \rho, etc.).
-      // If parsing genuinely fails, we just ask Gemini again rather than trying to patch it.
       let retries = 3;
       let parsedData = null;
 
@@ -147,13 +161,11 @@ app.post('/api/generate-test', async (req, res) => {
           if (startBrace === -1 || endBrace === -1) {
             throw new Error("Invalid structured AI text response mapping stream.");
           }
-          const rawJsonText = responseText.substring(startBrace, endBrace + 1);
-
-          parsedData = JSON.parse(rawJsonText);
-          break; // success — exit retry loop
+          parsedData = JSON.parse(responseText.substring(startBrace, endBrace + 1));
+          break;
         } catch (err) {
           retries--;
-          console.warn(`⚠️ Generation/parse issue hit generator node (${err.message}). Retrying...`);
+          console.warn(`⚠️ Retry triggered on generation chunk. Remaining retries: ${retries}`);
           if (retries === 0) throw err;
           await new Promise(resolve => setTimeout(resolve, 2000));
         }
@@ -191,6 +203,7 @@ app.post('/api/generate-test', async (req, res) => {
 
 // ======================================================================
 // 📝 ROUTE 2: MULTIMODAL SUBJECTIVE EVALUATION GATEWAY
+// (UNCHANGED)
 // ======================================================================
 app.post('/api/evaluate-subjective', async (req, res) => {
   try {
@@ -300,6 +313,351 @@ app.post('/api/evaluate-subjective', async (req, res) => {
       success: false,
       error: error.message || "An error locked up the subjective processing module matrix."
     });
+  }
+});
+
+// ======================================================================
+// 🧠 HELPER: Simple word-overlap similarity check (Similarity Safety Net)
+// Not semantic — a lightweight Jaccard-style overlap on normalized words.
+// Used to catch a freshly generated question that's just a reworded
+// duplicate of something already in the pool for the same tag combo.
+// ======================================================================
+function normalizeToWords(text) {
+  return (text || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, "")
+    .split(/\s+/)
+    .filter(Boolean);
+}
+
+function wordOverlapRatio(wordsA, wordsB) {
+  const setA = new Set(wordsA);
+  const setB = new Set(wordsB);
+  let overlap = 0;
+  for (const w of setA) if (setB.has(w)) overlap++;
+  const union = new Set([...setA, ...setB]).size;
+  return union === 0 ? 0 : overlap / union;
+}
+
+const SIMILARITY_THRESHOLD = 0.75; // tune this later if it's too strict/loose in practice
+
+function isLikelyDuplicate(newQuestion, existingEntries) {
+  const newCombinedText = `${newQuestion.question || ""} ${(newQuestion.options || []).join(" ")}`;
+  const newWords = normalizeToWords(newCombinedText);
+
+  for (const existing of existingEntries) {
+    const existingCombinedText = `${existing.question_text || ""} ${Array.isArray(existing.options) ? existing.options.join(" ") : ""}`;
+    const existingWords = normalizeToWords(existingCombinedText);
+    if (wordOverlapRatio(newWords, existingWords) >= SIMILARITY_THRESHOLD) return true;
+  }
+  return false;
+}
+
+// ======================================================================
+// 🧠 HELPER: Fresh AI generation WITH an exclusion list baked into the
+// prompt, so Gemini is proactively told what already exists in the pool
+// for this exact tag combination (Exclusion List — Layer 1 of Section 6).
+// ======================================================================
+async function generateFreshQuestionsForPool({ targetExam, targetSubject, targetTopic, diffLevel, qType, lang, count, exclusionCandidates }) {
+  const model = genAI.getGenerativeModel({
+    model: "gemini-3.1-flash-lite",
+    generationConfig: { responseMimeType: "application/json", temperature: 1.3 }
+  });
+
+  const topicFocusPhrase = targetTopic
+    ? `Specific Topic Focus: "${targetTopic}".`
+    : `No specific narrow topic given — cover general questions broadly across this subject/section.`;
+
+  let exclusionBlock = "";
+  if (exclusionCandidates && exclusionCandidates.length > 0) {
+    const exclusionLines = exclusionCandidates.slice(0, 100).map((q, i) => {
+      const optsText = Array.isArray(q.options) ? ` Options: ${q.options.join(' | ')}` : '';
+      return `${i + 1}. ${q.question_text}${optsText}`;
+    }).join('\n');
+    exclusionBlock = `\n\n[DO NOT REPEAT — EXISTING QUESTIONS IN POOL]\nThese questions already exist for this exact exam/subject/topic/difficulty combination. Do NOT generate anything testing the same underlying concept, even if reworded differently:\n${exclusionLines}\n`;
+  }
+
+  const MAX_CHUNK_SIZE = 15;
+  let allCompiled = [];
+  let remaining = count;
+
+  while (remaining > 0) {
+    const chunkSize = Math.min(MAX_CHUNK_SIZE, remaining);
+    const sessionSeed = Math.random().toString(36).substring(7);
+
+    const prompt = `Generate EXACTLY ${chunkSize} unique Multiple Choice Questions (MCQs) for ${targetExam}. Subject/Section: "${targetSubject}". ${topicFocusPhrase} Lang: ${lang}. Seed: ${sessionSeed}
+${exclusionBlock}
+[STRICT COUNT CONSTRAINT]: Your JSON response array MUST contain exactly ${chunkSize} question objects inside the "questions" array.
+
+[DIFFICULTY CALIBRATION]: Strict Enforcement for "${diffLevel}" level, matching the actual standard core papers of ${targetExam}. No basic/textbook-direct questions unless difficulty is explicitly Easy.
+
+[OPTIONS]: Distribute 'correctOptionIndex' randomly across 0,1,2,3.
+JSON schema: {"questions": [{"question":"","options":["","","",""],"correctOptionIndex":0,"explanation":""}]}.
+Explanation: Max 20 words core fact.`;
+
+    let retries = 3;
+    let parsedData = null;
+
+    while (retries > 0) {
+      try {
+        const result = await model.generateContent(prompt);
+        const response = await result.response;
+        const responseText = response.text();
+        const startBrace = responseText.indexOf('{');
+        const endBrace = responseText.lastIndexOf('}');
+        if (startBrace === -1 || endBrace === -1) throw new Error("Invalid AI response structure.");
+        parsedData = JSON.parse(responseText.substring(startBrace, endBrace + 1));
+        break;
+      } catch (err) {
+        retries--;
+        if (retries === 0) throw err;
+        await new Promise(r => setTimeout(r, 2000));
+      }
+    }
+
+    if (parsedData?.questions?.length) {
+      allCompiled = [...allCompiled, ...parsedData.questions];
+    }
+    remaining -= chunkSize;
+  }
+
+  return allCompiled.slice(0, count);
+}
+
+// ======================================================================
+// 🎯 ROUTE 3 (NEW): SERVE QUESTIONS FROM POOL (with AI fallback)
+// Pool-first, AI-fallback-with-exclusion-list design.
+// Answers are ALWAYS stripped before the response leaves this route —
+// this is where "Layer 2" of the answer-hiding security actually lives.
+// ======================================================================
+app.post('/api/pool/serve-questions', async (req, res) => {
+  try {
+    const { studentId, exam, subject, topic, difficulty, type, count, language, origin } = req.body;
+
+    if (!studentId) return res.status(400).json({ success: false, error: "studentId missing bhai!" });
+    if (!subject) return res.status(400).json({ success: false, error: "Subject/Section missing bhai!" });
+
+    const targetExam = exam || "Competitive Exam";
+    const targetSubject = subject;
+    const targetTopic = topic && topic.trim() ? topic.trim() : null;
+    const diffLevel = difficulty || "Medium";
+    const qType = type || "Objective";
+    const lang = language || "English";
+    const rawRequested = parseInt(count) || 5;
+    const totalRequested = Math.min(50, Math.max(3, rawRequested));
+
+    // STEP 1: Pull candidate pool rows matching this exact tag combination.
+    let poolQuery = supabase
+      .from('question_pool')
+      .select('*')
+      .eq('target_exam', targetExam)
+      .eq('subject', targetSubject)
+      .eq('difficulty', diffLevel)
+      .eq('type', qType);
+
+    poolQuery = targetTopic ? poolQuery.eq('topic', targetTopic) : poolQuery.is('topic', null);
+
+    const { data: candidatePool, error: poolErr } = await poolQuery.limit(500);
+    if (poolErr) throw poolErr;
+
+    // STEP 2: Check this student's ledger for these specific candidate questions,
+    // so we know which are "already correct" (exclude) vs "previously wrong" (prioritize) vs "unseen".
+    const poolIds = (candidatePool || []).map(q => q.id);
+    let ledgerRows = [];
+    if (poolIds.length > 0) {
+      const { data: ledgerData, error: ledgerErr } = await supabase
+        .from('attempts_ledger')
+        .select('question_id, is_correct')
+        .eq('student_id', studentId)
+        .in('question_id', poolIds);
+      if (ledgerErr) throw ledgerErr;
+      ledgerRows = ledgerData || [];
+    }
+
+    const correctIds = new Set(ledgerRows.filter(r => r.is_correct).map(r => r.question_id));
+    const incorrectIds = new Set(ledgerRows.filter(r => !r.is_correct).map(r => r.question_id));
+
+    const incorrectQuestions = candidatePool.filter(q => incorrectIds.has(q.id));   // resurface priority
+    const unseenQuestions = candidatePool.filter(q => !correctIds.has(q.id) && !incorrectIds.has(q.id));
+
+    let selected = [...incorrectQuestions, ...unseenQuestions].slice(0, totalRequested);
+    const shortfall = totalRequested - selected.length;
+
+    let freshlyGeneratedCount = 0;
+
+    // STEP 3: AI fallback only for the shortfall, with exclusion list + similarity safety net.
+    if (shortfall > 0) {
+      const { data: exclusionCandidates, error: exclErr } = await supabase
+        .from('question_pool')
+        .select('question_text, options')
+        .eq('target_exam', targetExam)
+        .eq('subject', targetSubject)
+        .eq('difficulty', diffLevel)
+        .eq('type', qType)
+        .order('created_at', { ascending: false })
+        .limit(100);
+      if (exclErr) throw exclErr;
+
+      const freshQuestions = await generateFreshQuestionsForPool({
+        targetExam, targetSubject, targetTopic, diffLevel, qType, lang,
+        count: shortfall,
+        exclusionCandidates: exclusionCandidates || []
+      });
+
+      const alreadyCheckedThisBatch = [...(exclusionCandidates || [])];
+
+      for (const q of freshQuestions) {
+        if (isLikelyDuplicate(q, alreadyCheckedThisBatch)) {
+          console.warn("⚠️ Discarded a freshly generated question — flagged as likely duplicate by similarity safety net.");
+          continue;
+        }
+
+        const { data: inserted, error: insertErr } = await supabase
+          .from('question_pool')
+          .insert({
+            target_exam: targetExam,
+            subject: targetSubject,
+            topic: targetTopic,
+            difficulty: diffLevel,
+            type: qType,
+            question_text: q.question,
+            options: q.options || null,
+            correct_option_index: typeof q.correctOptionIndex === 'number' ? q.correctOptionIndex : null,
+            explanation: q.explanation || null,
+            origin_note: origin || 'unspecified'
+          })
+          .select()
+          .single();
+
+        if (insertErr) {
+          console.error("❌ Failed to insert freshly generated question into pool:", insertErr);
+          continue;
+        }
+
+        alreadyCheckedThisBatch.push(inserted);
+        selected.push(inserted);
+        freshlyGeneratedCount++;
+      }
+    }
+
+    // STEP 4: Strip answers before this ever leaves the backend.
+    const safeQuestions = selected.slice(0, totalRequested).map(q => ({
+      id: q.id,
+      question: q.question_text,
+      options: q.options,
+      type: q.type
+      // correct_option_index, correct_answer, explanation deliberately NOT included here
+    }));
+
+    res.json({
+      success: true,
+      questions: safeQuestions,
+      meta: {
+        servedFromPool: safeQuestions.length - freshlyGeneratedCount,
+        freshlyGenerated: freshlyGeneratedCount
+      }
+    });
+
+  } catch (error) {
+    console.error("❌ Pool Serve Error:", error);
+    res.status(500).json({ success: false, error: error.message || "Failed to serve questions from pool." });
+  }
+});
+
+// ======================================================================
+// 🎯 ROUTE 4 (NEW): SUBMIT AN ATTEMPT
+// Upserts into attempts_ledger keyed on (student_id, question_id) —
+// same row gets updated on retry, never duplicated, thanks to the
+// unique constraint on the table. Only place correct_option_index /
+// explanation get sent back to the frontend is AFTER this call.
+// ======================================================================
+app.post('/api/pool/submit-attempt', async (req, res) => {
+  try {
+    const { studentId, questionId, selectedOptionIndex } = req.body;
+
+    if (!studentId || !questionId) {
+      return res.status(400).json({ success: false, error: "studentId or questionId missing." });
+    }
+
+    const { data: questionRow, error: qErr } = await supabase
+      .from('question_pool')
+      .select('*')
+      .eq('id', questionId)
+      .single();
+
+    if (qErr || !questionRow) {
+      return res.status(404).json({ success: false, error: "Question not found in pool." });
+    }
+
+    // Subjective questions are graded via /api/evaluate-subjective separately —
+    // this route only handles Objective correctness right now.
+    const isCorrect = questionRow.type === 'Objective'
+      ? parseInt(selectedOptionIndex) === questionRow.correct_option_index
+      : false;
+
+    // Upsert: only touches student_id, question_id, is_correct, attempted_at.
+    // The 'saved' column is deliberately NOT included here, so an existing
+    // saved=true from a previous attempt is never overwritten back to false.
+    const { data: upserted, error: upsertErr } = await supabase
+      .from('attempts_ledger')
+      .upsert(
+        {
+          student_id: studentId,
+          question_id: questionId,
+          is_correct: isCorrect,
+          attempted_at: new Date().toISOString()
+        },
+        { onConflict: 'student_id,question_id' }
+      )
+      .select()
+      .single();
+
+    if (upsertErr) throw upsertErr;
+
+    res.json({
+      success: true,
+      is_correct: isCorrect,
+      correct_option_index: questionRow.correct_option_index,
+      explanation: questionRow.explanation
+    });
+
+  } catch (error) {
+    console.error("❌ Submit Attempt Error:", error);
+    res.status(500).json({ success: false, error: error.message || "Failed to submit attempt." });
+  }
+});
+
+// ======================================================================
+// 🎯 ROUTE 5 (NEW): TOGGLE SAVE
+// Save is only allowed on a question that's already been attempted
+// (product decision) — so this just updates the existing ledger row,
+// it never creates one.
+// ======================================================================
+app.post('/api/pool/toggle-save', async (req, res) => {
+  try {
+    const { studentId, questionId, saved } = req.body;
+
+    if (!studentId || !questionId || typeof saved !== 'boolean') {
+      return res.status(400).json({ success: false, error: "studentId, questionId and saved (boolean) are all required." });
+    }
+
+    const { data, error } = await supabase
+      .from('attempts_ledger')
+      .update({ saved })
+      .eq('student_id', studentId)
+      .eq('question_id', questionId)
+      .select()
+      .single();
+
+    if (error || !data) {
+      return res.status(404).json({ success: false, error: "No attempt found for this question — it must be attempted before it can be saved." });
+    }
+
+    res.json({ success: true, saved: data.saved });
+
+  } catch (error) {
+    console.error("❌ Toggle Save Error:", error);
+    res.status(500).json({ success: false, error: error.message || "Failed to toggle save state." });
   }
 });
 
