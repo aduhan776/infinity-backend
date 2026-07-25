@@ -207,7 +207,7 @@ app.post('/api/generate-test', async (req, res) => {
 // ======================================================================
 app.post('/api/evaluate-subjective', async (req, res) => {
   try {
-    const { question, userAnswer, uploadedFiles, testTitle, maxMarks } = req.body;
+    const { question, userAnswer, uploadedFiles, testTitle, maxMarks, studentId, questionId } = req.body;
 
     if (!question) {
       return res.status(400).json({ success: false, error: "Question metadata reference is missing!" });
@@ -295,6 +295,33 @@ app.post('/api/evaluate-subjective', async (req, res) => {
     scoreGiven = Math.min(parsedMaxMarks, Math.max(0.0, scoreGiven)); // Hard clamp validation fence
 
     console.log(`✅ Subjective Evaluation Complete! Core Score Compiled: ${scoreGiven}/${parsedMaxMarks}`);
+
+    // 🎯 POOL LEDGER UPDATE (optional — only when this question came from the
+    // shared question pool). Subjective questions don't have a strict
+    // right/wrong answer, so "correct" for resurfacing purposes is defined
+    // as scoring at least 30% of the max marks. Below that, the question
+    // stays eligible to resurface (mirrors wrong-answer resurfacing for MCQs).
+    if (studentId && questionId) {
+      try {
+        const passThreshold = 0.3;
+        const isCorrect = parsedMaxMarks > 0 ? (scoreGiven / parsedMaxMarks) >= passThreshold : false;
+
+        await supabase
+          .from('attempts_ledger')
+          .upsert(
+            {
+              student_id: studentId,
+              question_id: questionId,
+              is_correct: isCorrect,
+              attempted_at: new Date().toISOString()
+            },
+            { onConflict: 'student_id,question_id' }
+          );
+      } catch (ledgerErr) {
+        // Never let ledger bookkeeping block the student from getting their score back.
+        console.error("⚠️ Subjective ledger update failed (non-blocking):", ledgerErr);
+      }
+    }
 
     res.json({
       success: true,
@@ -385,7 +412,18 @@ async function generateFreshQuestionsForPool({ targetExam, targetSubject, target
     const chunkSize = Math.min(MAX_CHUNK_SIZE, remaining);
     const sessionSeed = Math.random().toString(36).substring(7);
 
-    const prompt = `Generate EXACTLY ${chunkSize} unique Multiple Choice Questions (MCQs) for ${targetExam}. Subject/Section: "${targetSubject}". ${topicFocusPhrase} Lang: ${lang}. Seed: ${sessionSeed}
+    let prompt = "";
+    if (qType === 'Subjective') {
+      prompt = `Generate EXACTLY ${chunkSize} distinct descriptive/subjective questions for ${targetExam}. Subject/Section: "${targetSubject}". ${topicFocusPhrase} Lang: ${lang}. Seed: ${sessionSeed}
+${exclusionBlock}
+[STRICT COUNT CONSTRAINT]: Your JSON response array MUST contain exactly ${chunkSize} question object(s) inside the "questions" array.
+
+[DIFFICULTY CALIBRATION]: Strict Enforcement for "${diffLevel}" level, matching the actual standard core papers of ${targetExam}.
+
+JSON schema: {"questions": [{"question":"","explanation":""}]}.
+Explanation: Max 35 words core grading framework points (used only as an internal marking-guideline hint, never shown to the student before they answer).`;
+    } else {
+      prompt = `Generate EXACTLY ${chunkSize} unique Multiple Choice Questions (MCQs) for ${targetExam}. Subject/Section: "${targetSubject}". ${topicFocusPhrase} Lang: ${lang}. Seed: ${sessionSeed}
 ${exclusionBlock}
 [STRICT COUNT CONSTRAINT]: Your JSON response array MUST contain exactly ${chunkSize} question objects inside the "questions" array.
 
@@ -394,6 +432,7 @@ ${exclusionBlock}
 [OPTIONS]: Distribute 'correctOptionIndex' randomly across 0,1,2,3.
 JSON schema: {"questions": [{"question":"","options":["","","",""],"correctOptionIndex":0,"explanation":""}]}.
 Explanation: Max 20 words core fact.`;
+    }
 
     let retries = 3;
     let parsedData = null;
@@ -658,6 +697,203 @@ app.post('/api/pool/toggle-save', async (req, res) => {
   } catch (error) {
     console.error("❌ Toggle Save Error:", error);
     res.status(500).json({ success: false, error: error.message || "Failed to toggle save state." });
+  }
+});
+
+// ======================================================================
+// 🎯 ROUTE 6 (NEW): BUILD A FULL TEST PAPER FROM THE POOL (with AI fallback)
+// Used by AI Labs — unlike /api/pool/serve-questions, this DOES return
+// full answer data (correctOptionIndex, explanation), because AI Labs
+// builds a complete exam paper upfront and hands it to TestPortal for a
+// timed attempt, same security model as the existing admin-made
+// mock_tests (not a new regression — see "Secure Test Delivery" future
+// project for hardening this properly across the whole app).
+// Supports both Objective and Subjective question types.
+// ======================================================================
+app.post('/api/pool/build-test', async (req, res) => {
+  try {
+    const { studentId, exam, subject, topic, difficulty, type, count, language, origin } = req.body;
+
+    if (!studentId) return res.status(400).json({ success: false, error: "studentId missing bhai!" });
+    if (!subject) return res.status(400).json({ success: false, error: "Subject/Section missing bhai!" });
+
+    const targetExam = exam || "Competitive Exam";
+    const targetSubject = subject;
+    const targetTopic = topic && topic.trim() ? topic.trim() : null;
+    const diffLevel = difficulty || "Medium";
+    const qType = type || "Objective";
+    const lang = language || "English";
+    const rawRequested = parseInt(count) || 5;
+    const totalRequested = Math.min(50, Math.max(1, rawRequested));
+
+    // STEP 1: Pull candidate pool rows matching this exact tag combination.
+    let poolQuery = supabase
+      .from('question_pool')
+      .select('*')
+      .eq('target_exam', targetExam)
+      .eq('subject', targetSubject)
+      .eq('difficulty', diffLevel)
+      .eq('type', qType);
+
+    poolQuery = targetTopic ? poolQuery.eq('topic', targetTopic) : poolQuery.is('topic', null);
+
+    const { data: candidatePool, error: poolErr } = await poolQuery.limit(500);
+    if (poolErr) throw poolErr;
+
+    // STEP 2: Ledger check — same resurfacing rule as serve-questions.
+    const poolIds = (candidatePool || []).map(q => q.id);
+    let ledgerRows = [];
+    if (poolIds.length > 0) {
+      const { data: ledgerData, error: ledgerErr } = await supabase
+        .from('attempts_ledger')
+        .select('question_id, is_correct')
+        .eq('student_id', studentId)
+        .in('question_id', poolIds);
+      if (ledgerErr) throw ledgerErr;
+      ledgerRows = ledgerData || [];
+    }
+
+    const correctIds = new Set(ledgerRows.filter(r => r.is_correct).map(r => r.question_id));
+    const incorrectIds = new Set(ledgerRows.filter(r => !r.is_correct).map(r => r.question_id));
+
+    const incorrectQuestions = candidatePool.filter(q => incorrectIds.has(q.id));
+    const unseenQuestions = candidatePool.filter(q => !correctIds.has(q.id) && !incorrectIds.has(q.id));
+
+    let selected = [...incorrectQuestions, ...unseenQuestions].slice(0, totalRequested);
+    const shortfall = totalRequested - selected.length;
+
+    let freshlyGeneratedCount = 0;
+
+    if (shortfall > 0) {
+      const { data: exclusionCandidates, error: exclErr } = await supabase
+        .from('question_pool')
+        .select('question_text, options')
+        .eq('target_exam', targetExam)
+        .eq('subject', targetSubject)
+        .eq('difficulty', diffLevel)
+        .eq('type', qType)
+        .order('created_at', { ascending: false })
+        .limit(100);
+      if (exclErr) throw exclErr;
+
+      const freshQuestions = await generateFreshQuestionsForPool({
+        targetExam, targetSubject, targetTopic, diffLevel, qType, lang,
+        count: shortfall,
+        exclusionCandidates: exclusionCandidates || []
+      });
+
+      const alreadyCheckedThisBatch = [...(exclusionCandidates || [])];
+
+      for (const q of freshQuestions) {
+        if (isLikelyDuplicate(q, alreadyCheckedThisBatch)) {
+          console.warn("⚠️ Discarded a freshly generated question — flagged as likely duplicate by similarity safety net.");
+          continue;
+        }
+
+        const insertPayload = {
+          target_exam: targetExam,
+          subject: targetSubject,
+          topic: targetTopic,
+          difficulty: diffLevel,
+          type: qType,
+          question_text: q.question,
+          origin_note: origin || 'unspecified'
+        };
+
+        if (qType === 'Objective') {
+          insertPayload.options = q.options || null;
+          insertPayload.correct_option_index = typeof q.correctOptionIndex === 'number' ? q.correctOptionIndex : null;
+          insertPayload.explanation = q.explanation || null;
+        } else {
+          // Subjective: no options/correct_option_index — graded later via AI evaluation.
+          insertPayload.explanation = q.explanation || null; // internal marking-guideline hint only
+        }
+
+        const { data: inserted, error: insertErr } = await supabase
+          .from('question_pool')
+          .insert(insertPayload)
+          .select()
+          .single();
+
+        if (insertErr) {
+          console.error("❌ Failed to insert freshly generated question into pool:", insertErr);
+          continue;
+        }
+
+        alreadyCheckedThisBatch.push(inserted);
+        selected.push(inserted);
+        freshlyGeneratedCount++;
+      }
+    }
+
+    // STEP 3: Return FULL data — this route intentionally does NOT strip answers.
+    const fullQuestions = selected.slice(0, totalRequested).map(q => ({
+      id: q.id,
+      question: q.question_text,
+      options: q.options,
+      correctOptionIndex: q.correct_option_index,
+      explanation: q.explanation,
+      type: q.type
+    }));
+
+    res.json({
+      success: true,
+      questions: fullQuestions,
+      meta: {
+        servedFromPool: fullQuestions.length - freshlyGeneratedCount,
+        freshlyGenerated: freshlyGeneratedCount
+      }
+    });
+
+  } catch (error) {
+    console.error("❌ Build Test Error:", error);
+    res.status(500).json({ success: false, error: error.message || "Failed to build test from pool." });
+  }
+});
+
+// ======================================================================
+// 🎯 ROUTE 7 (NEW): GET SAVED QUESTIONS
+// Powers Library.jsx (full saved-question details) and Statistics.jsx
+// (saved-question count). Joins attempts_ledger -> question_pool so the
+// full question text/options/explanation come back in one call — safe to
+// show full answer data here since these are ALWAYS post-attempt saves.
+// ======================================================================
+app.get('/api/pool/saved-questions', async (req, res) => {
+  try {
+    const { studentId } = req.query;
+
+    if (!studentId) return res.status(400).json({ success: false, error: "studentId missing bhai!" });
+
+    const { data, error } = await supabase
+      .from('attempts_ledger')
+      .select('question_id, is_correct, attempted_at, question_pool(question_text, options, correct_option_index, explanation, target_exam, subject, topic, type)')
+      .eq('student_id', studentId)
+      .eq('saved', true)
+      .order('attempted_at', { ascending: false });
+
+    if (error) throw error;
+
+    const savedQuestions = (data || [])
+      .filter(row => row.question_pool) // guard against a question that was deleted from the pool after being saved
+      .map(row => ({
+        id: row.question_id,
+        question: row.question_pool.question_text,
+        options: row.question_pool.options,
+        correctOptionIndex: row.question_pool.correct_option_index,
+        explanation: row.question_pool.explanation,
+        exam: row.question_pool.target_exam,
+        subject: row.question_pool.subject,
+        topic: row.question_pool.topic,
+        type: row.question_pool.type,
+        wasCorrect: row.is_correct,
+        savedAt: row.attempted_at
+      }));
+
+    res.json({ success: true, savedQuestions, count: savedQuestions.length });
+
+  } catch (error) {
+    console.error("❌ Saved Questions Fetch Error:", error);
+    res.status(500).json({ success: false, error: error.message || "Failed to fetch saved questions." });
   }
 });
 
