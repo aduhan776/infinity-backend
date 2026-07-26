@@ -714,18 +714,17 @@ app.post('/api/pool/toggle-save', async (req, res) => {
 });
 
 // ======================================================================
-// 🎯 ROUTE 6 (NEW): BUILD A FULL TEST PAPER FROM THE POOL (with AI fallback)
-// Used by AI Labs — unlike /api/pool/serve-questions, this DOES return
-// full answer data (correctOptionIndex, explanation), because AI Labs
-// builds a complete exam paper upfront and hands it to TestPortal for a
-// timed attempt, same security model as the existing admin-made
-// mock_tests (not a new regression — see "Secure Test Delivery" future
-// project for hardening this properly across the whole app).
+// 🎯 ROUTE 6: BUILD A FULL TEST PAPER FROM THE POOL (with AI fallback)
+// Used by AI Labs. As of "Secure Test Delivery", this route strips
+// answers from its response just like /api/pool/serve-questions —
+// correctness is only ever revealed after an attempt, via
+// /api/pool/grade-test. Full data is still written to question_pool
+// (server-side only) so grading has something to check against.
 // Supports both Objective and Subjective question types.
 // ======================================================================
 app.post('/api/pool/build-test', async (req, res) => {
   try {
-    const { studentId, exam, subject, topic, difficulty, type, count, language, origin } = req.body;
+    const { studentId, exam, subject, topic, difficulty, type, count, language, origin, revealAnswers } = req.body;
 
     if (!studentId) return res.status(400).json({ success: false, error: "studentId missing bhai!" });
     if (!subject) return res.status(400).json({ success: false, error: "Subject/Section missing bhai!" });
@@ -839,15 +838,19 @@ app.post('/api/pool/build-test', async (req, res) => {
       }
     }
 
-    // STEP 3: Return FULL data — this route intentionally does NOT strip answers.
-    const fullQuestions = selected.slice(0, totalRequested).map(q => ({
-      id: q.id,
-      question: q.question_text,
-      options: q.options,
-      correctOptionIndex: q.correct_option_index,
-      explanation: q.explanation,
-      type: q.type
-    }));
+    // STEP 3: Strip answers by default ("Secure Test Delivery") — correctness
+    // is only revealed post-attempt via /api/pool/grade-test. EXCEPTION:
+    // BrainFeed explicitly passes revealAnswers=true, since it's a casual
+    // practice quiz (not a timed exam) and wants instant feedback — that's
+    // a deliberate, informed trade-off, not an oversight.
+    const fullQuestions = selected.slice(0, totalRequested).map(q => {
+      const base = { id: q.id, question: q.question_text, options: q.options, type: q.type };
+      if (revealAnswers === true) {
+        base.correctOptionIndex = q.correct_option_index;
+        base.explanation = q.explanation;
+      }
+      return base;
+    });
 
     res.json({
       success: true,
@@ -907,6 +910,128 @@ app.get('/api/pool/saved-questions', async (req, res) => {
   } catch (error) {
     console.error("❌ Saved Questions Fetch Error:", error);
     res.status(500).json({ success: false, error: error.message || "Failed to fetch saved questions." });
+  }
+});
+
+// ======================================================================
+// 🎯 ROUTE 8 (NEW): GRADE A TEST — "Secure Test Delivery"
+// TestPortal sends back {questionId, selectedOptionIndex, marks, neg} for
+// every attempted Objective question — NEVER the answer itself, since it
+// was never sent to the browser to begin with. This route resolves the
+// real answer server-side:
+//   1. Try question_pool first (covers ALL AI Labs questions — fresh or
+//      published to mock_tests, since their id is always a real pool UUID).
+//   2. Fall back to the mock_tests row's embedded questions_list (covers
+//      Custom Builder-authored questions, which never touch the pool by
+//      design — admin owns those answers directly).
+// Also logs pool ledger entries for anything resolved via the pool.
+// ======================================================================
+app.post('/api/pool/grade-test', async (req, res) => {
+  try {
+    const { studentId, testId, answers } = req.body;
+
+    if (!Array.isArray(answers) || answers.length === 0) {
+      return res.json({ success: true, results: [], totalScore: 0, correctCount: 0, incorrectCount: 0 });
+    }
+
+    const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    const candidatePoolIds = answers.map(a => a.questionId).filter(id => uuidRegex.test(String(id)));
+
+    // STEP 1: Resolve as many as possible from question_pool.
+    let poolAnswerMap = {};
+    if (candidatePoolIds.length > 0) {
+      const { data: poolRows, error: poolErr } = await supabase
+        .from('question_pool')
+        .select('id, correct_option_index, explanation')
+        .in('id', candidatePoolIds);
+      if (poolErr) throw poolErr;
+      (poolRows || []).forEach(row => {
+        poolAnswerMap[row.id] = { correctOptionIndex: row.correct_option_index, explanation: row.explanation };
+      });
+    }
+
+    // STEP 2: Anything not resolved via the pool falls back to the
+    // mock_tests row's own embedded questions_list (Custom Builder path).
+    const unresolvedIds = answers.map(a => String(a.questionId)).filter(id => !poolAnswerMap[id]);
+    let mockTestsAnswerMap = {};
+    if (unresolvedIds.length > 0 && testId) {
+      const { data: mockRow, error: mockErr } = await supabase
+        .from('mock_tests')
+        .select('questions_list')
+        .eq('id', testId)
+        .maybeSingle();
+      if (!mockErr && mockRow && Array.isArray(mockRow.questions_list)) {
+        mockRow.questions_list.forEach(q => {
+          if (unresolvedIds.includes(String(q.id))) {
+            const correctVal = q.correct !== undefined ? q.correct : q.correctOptionIndex;
+            mockTestsAnswerMap[String(q.id)] = { correctOptionIndex: correctVal, explanation: q.explanation };
+          }
+        });
+      }
+    }
+
+    // STEP 3: Score every answer + build the ledger update list.
+    let totalScore = 0;
+    let correctCount = 0;
+    let incorrectCount = 0;
+    const results = [];
+    const ledgerUpserts = [];
+
+    for (const ans of answers) {
+      const qid = String(ans.questionId);
+      const wasAttempted = ans.selectedOptionIndex !== null && ans.selectedOptionIndex !== undefined && ans.selectedOptionIndex !== "";
+      const source = poolAnswerMap[qid] || mockTestsAnswerMap[qid];
+      const correctOptionIndex = source ? source.correctOptionIndex : null;
+      const explanation = source ? source.explanation : null;
+      const selectedOptionIndex = wasAttempted ? parseInt(ans.selectedOptionIndex) : null;
+      const hasResolvedAnswer = correctOptionIndex !== null && correctOptionIndex !== undefined;
+      const isCorrect = wasAttempted && hasResolvedAnswer && selectedOptionIndex === parseInt(correctOptionIndex);
+
+      const marksVal = parseFloat(String(ans.marks || '2.0').replace('+', '')) || 0;
+      const negVal = parseFloat(String(ans.neg || '0.66').replace('-', '')) || 0;
+      // Skipped questions never affect score or correct/incorrect counts —
+      // they're only included here so the analysis screen can still show
+      // the right answer for a question the student didn't attempt.
+      const marksAwarded = (!wasAttempted || !hasResolvedAnswer) ? 0 : (isCorrect ? marksVal : -negVal);
+
+      totalScore += marksAwarded;
+      if (wasAttempted && hasResolvedAnswer) {
+        if (isCorrect) correctCount++; else incorrectCount++;
+      }
+
+      results.push({ questionId: qid, isCorrect, correctOptionIndex, explanation, marksAwarded, wasAttempted });
+
+      // Only pool-resolved, ACTUALLY ATTEMPTED questions get logged to the
+      // shared ledger — Custom Builder questions were never in the pool,
+      // and skipped questions shouldn't count as "seen and mastered/missed".
+      if (studentId && wasAttempted && poolAnswerMap[qid]) {
+        ledgerUpserts.push({
+          student_id: studentId,
+          question_id: qid,
+          is_correct: isCorrect,
+          attempted_at: new Date().toISOString()
+        });
+      }
+    }
+
+    if (ledgerUpserts.length > 0) {
+      const { error: ledgerErr } = await supabase
+        .from('attempts_ledger')
+        .upsert(ledgerUpserts, { onConflict: 'student_id,question_id' });
+      if (ledgerErr) console.error("⚠️ Batch ledger update failed (non-blocking):", ledgerErr);
+    }
+
+    res.json({
+      success: true,
+      results,
+      totalScore: parseFloat(totalScore.toFixed(2)),
+      correctCount,
+      incorrectCount
+    });
+
+  } catch (error) {
+    console.error("❌ Grade Test Error:", error);
+    res.status(500).json({ success: false, error: error.message || "Failed to grade test." });
   }
 });
 
