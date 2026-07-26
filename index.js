@@ -951,22 +951,31 @@ app.post('/api/pool/grade-test', async (req, res) => {
     }
 
     // STEP 2: Anything not resolved via the pool falls back to the
-    // mock_tests row's own embedded questions_list (Custom Builder path).
+    // mock_tests row's own embedded question content (Custom Builder path).
+    // Checks BOTH shapes — flat questions_list (non-sectional) and
+    // sections[].questions (sectional tests).
     const unresolvedIds = answers.map(a => String(a.questionId)).filter(id => !poolAnswerMap[id]);
     let mockTestsAnswerMap = {};
     if (unresolvedIds.length > 0 && testId) {
       const { data: mockRow, error: mockErr } = await supabase
         .from('mock_tests')
-        .select('questions_list')
+        .select('questions_list, sections')
         .eq('id', testId)
         .maybeSingle();
-      if (!mockErr && mockRow && Array.isArray(mockRow.questions_list)) {
-        mockRow.questions_list.forEach(q => {
+
+      if (!mockErr && mockRow) {
+        const registerQuestion = (q) => {
           if (unresolvedIds.includes(String(q.id))) {
             const correctVal = q.correct !== undefined ? q.correct : q.correctOptionIndex;
             mockTestsAnswerMap[String(q.id)] = { correctOptionIndex: correctVal, explanation: q.explanation };
           }
-        });
+        };
+        if (Array.isArray(mockRow.questions_list)) mockRow.questions_list.forEach(registerQuestion);
+        if (Array.isArray(mockRow.sections)) {
+          mockRow.sections.forEach(sec => {
+            if (Array.isArray(sec.questions)) sec.questions.forEach(registerQuestion);
+          });
+        }
       }
     }
 
@@ -1032,6 +1041,94 @@ app.post('/api/pool/grade-test', async (req, res) => {
   } catch (error) {
     console.error("❌ Grade Test Error:", error);
     res.status(500).json({ success: false, error: error.message || "Failed to grade test." });
+  }
+});
+
+// ======================================================================
+// 🧠 HELPER: Deep-strip correct answers from a mock_tests row's question
+// content, handling BOTH shapes that exist in the table — flat
+// questions_list (non-sectional tests) and sections[].questions
+// (sectional tests). Used by /api/tests/load when reveal=false.
+// ======================================================================
+function stripMockTestAnswers(row) {
+  const stripped = { ...row };
+
+  if (Array.isArray(stripped.questions_list)) {
+    stripped.questions_list = stripped.questions_list.map(q => {
+      const { correct, correctOptionIndex, explanation, ...rest } = q;
+      return rest;
+    });
+  }
+
+  if (Array.isArray(stripped.sections)) {
+    stripped.sections = stripped.sections.map(sec => {
+      if (!Array.isArray(sec.questions)) return sec;
+      return {
+        ...sec,
+        questions: sec.questions.map(q => {
+          const { correct, correctOptionIndex, explanation, ...rest } = q;
+          return rest;
+        })
+      };
+    });
+  }
+
+  return stripped;
+}
+
+// ======================================================================
+// 🎯 ROUTE 9 (NEW): BROWSE TEST SERIES — "Secure Test Delivery" for
+// mock_tests. Returns every row's metadata (category/series/section
+// structure, title, time, question count) but NEVER the actual question
+// content — browsing the catalogue should never leak an entire table's
+// worth of answer keys. Powers TestSeries.jsx's category/series/section
+// tree, which only ever needs counts and titles to render.
+// ======================================================================
+app.get('/api/tests/browse', async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('mock_tests')
+      .select('id, category_name, series_name, sub_section, title, questions, time, has_sectional_timing, created_at')
+      .order('created_at', { ascending: false });
+
+    if (error) throw error;
+
+    res.json({ success: true, tests: data || [] });
+
+  } catch (error) {
+    console.error("❌ Tests Browse Error:", error);
+    res.status(500).json({ success: false, error: error.message || "Failed to browse test series." });
+  }
+});
+
+// ======================================================================
+// 🎯 ROUTE 10 (NEW): LOAD A SINGLE TEST — "Secure Test Delivery" for
+// mock_tests. reveal=false (default) strips answers, for starting/
+// reattempting a test. reveal=true returns full data, for reviewing an
+// already-completed attempt (post-hoc reveal is fine — the student
+// already finished that attempt).
+// ======================================================================
+app.get('/api/tests/load', async (req, res) => {
+  try {
+    const { testId, reveal } = req.query;
+    if (!testId) return res.status(400).json({ success: false, error: "testId missing bhai!" });
+
+    const { data, error } = await supabase
+      .from('mock_tests')
+      .select('*')
+      .eq('id', testId)
+      .maybeSingle();
+
+    if (error) throw error;
+    if (!data) return res.status(404).json({ success: false, error: "Test not found." });
+
+    const responseTest = (reveal === 'true') ? data : stripMockTestAnswers(data);
+
+    res.json({ success: true, test: responseTest });
+
+  } catch (error) {
+    console.error("❌ Test Load Error:", error);
+    res.status(500).json({ success: false, error: error.message || "Failed to load test." });
   }
 });
 
