@@ -550,7 +550,6 @@ app.post('/api/pool/serve-questions', async (req, res) => {
         .select('question_text, options')
         .eq('target_exam', targetExam)
         .eq('subject', targetSubject)
-        .eq('difficulty', diffLevel)
         .eq('type', qType)
         .order('created_at', { ascending: false })
         .limit(100);
@@ -781,6 +780,9 @@ app.post('/api/pool/build-test', async (req, res) => {
     // sees "new" questions that are really just the previous 15 again.
     // Fresh session starts (BrainFeed reopened, AI Labs build) omit this
     // flag entirely, so wrong-answer resurfacing keeps working as before.
+    // NOTE: this only works correctly if the ledger is fully up to date by
+    // the time this query runs — see the frontend fix that awaits pending
+    // submit-attempt writes before firing the Load More request.
     const incorrectQuestions = skipResurfacing ? [] : candidatePool.filter(q => incorrectIds.has(q.id));
     const unseenQuestions = candidatePool.filter(q => !correctIds.has(q.id) && !incorrectIds.has(q.id));
 
@@ -795,7 +797,6 @@ app.post('/api/pool/build-test', async (req, res) => {
         .select('question_text, options')
         .eq('target_exam', targetExam)
         .eq('subject', targetSubject)
-        .eq('difficulty', diffLevel)
         .eq('type', qType)
         .order('created_at', { ascending: false })
         .limit(100);
