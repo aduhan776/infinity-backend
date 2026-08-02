@@ -125,6 +125,9 @@ app.post('/api/generate-test', async (req, res) => {
         [STRUCTURE]: For multi-statement, matching, or list-based questions, do NOT lump statements into one paragraph. You MUST format statements as a clean numbered vertical list (e.g., "Consider the following statements:\\n\\n1. [Statement 1]\\n\\n2. [Statement 2]") with explicit double escaped newlines (\\n\\n) after each item so the frontend renders them beautifully.
         
         [OPTIONS]: Distribute 'correctOptionIndex' randomly across 0,1,2,3.
+
+        [SELF-VERIFICATION — MANDATORY BEFORE FINALIZING EACH QUESTION]: Before writing out each question's final options, silently work through this check yourself: (1) Confirm exactly ONE option is unambiguously, factually correct. (2) Confirm the other three are clearly, definitively wrong — not partially true, not "technically also correct under some interpretation", not overlapping in meaning with the correct option, not a subset/superset of it. (3) If your first draft of a question fails this check (two options both defensible, or none clearly correct), DISCARD that draft internally and write a completely different, cleaner question on the same topic instead — do not output a question you are not fully confident passes this check. Only the final, verified question objects should appear in your output.
+
         JSON schema: {"questions": [{"id":0,"question":"","options":["","","",""],"correctOptionIndex":0,"explanation":""}]}.
         Explanation: Max 20 words core fact wrapped in LaTeX where needed.`;
       } else {
@@ -443,6 +446,9 @@ ${exclusionBlock}
 [DIFFICULTY CALIBRATION]: Strict Enforcement for "${diffLevel}" level, matching the actual standard core papers of ${targetExam}. No basic/textbook-direct questions unless difficulty is explicitly Easy.
 
 [OPTIONS]: Distribute 'correctOptionIndex' randomly across 0,1,2,3.
+
+[SELF-VERIFICATION — MANDATORY BEFORE FINALIZING EACH QUESTION]: Before writing out each question's final options, silently work through this check yourself: (1) Confirm exactly ONE option is unambiguously, factually correct. (2) Confirm the other three are clearly, definitively wrong — not partially true, not "technically also correct under some interpretation", not overlapping in meaning with the correct option, not a subset/superset of it. (3) If your first draft of a question fails this check (two options both defensible, or none clearly correct), DISCARD that draft internally and write a completely different, cleaner question on the same topic instead — do not output a question you are not fully confident passes this check. Only the final, verified question objects should appear in your output.
+
 JSON schema: {"questions": [{"question":"","options":["","","",""],"correctOptionIndex":0,"explanation":""}]}.
 Explanation: Max 20 words core fact.`;
     }
@@ -724,7 +730,7 @@ app.post('/api/pool/toggle-save', async (req, res) => {
 // ======================================================================
 app.post('/api/pool/build-test', async (req, res) => {
   try {
-    const { studentId, exam, subject, topic, difficulty, type, count, language, origin, revealAnswers } = req.body;
+    const { studentId, exam, subject, topic, difficulty, type, count, language, origin, revealAnswers, skipResurfacing } = req.body;
 
     if (!studentId) return res.status(400).json({ success: false, error: "studentId missing bhai!" });
     if (!subject) return res.status(400).json({ success: false, error: "Subject/Section missing bhai!" });
@@ -768,7 +774,14 @@ app.post('/api/pool/build-test', async (req, res) => {
     const correctIds = new Set(ledgerRows.filter(r => r.is_correct).map(r => r.question_id));
     const incorrectIds = new Set(ledgerRows.filter(r => !r.is_correct).map(r => r.question_id));
 
-    const incorrectQuestions = candidatePool.filter(q => incorrectIds.has(q.id));
+    // 🔁 RESURFACING SKIP: "Load More" inside an already-running BrainFeed
+    // session sends skipResurfacing=true. Without this, a question marked
+    // wrong seconds ago (in the batch that JUST ended) would immediately
+    // resurface in the very next batch of the SAME session — the student
+    // sees "new" questions that are really just the previous 15 again.
+    // Fresh session starts (BrainFeed reopened, AI Labs build) omit this
+    // flag entirely, so wrong-answer resurfacing keeps working as before.
+    const incorrectQuestions = skipResurfacing ? [] : candidatePool.filter(q => incorrectIds.has(q.id));
     const unseenQuestions = candidatePool.filter(q => !correctIds.has(q.id) && !incorrectIds.has(q.id));
 
     let selected = [...incorrectQuestions, ...unseenQuestions].slice(0, totalRequested);
