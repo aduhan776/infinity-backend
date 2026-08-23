@@ -118,7 +118,13 @@ app.post('/api/generate-test', async (req, res) => {
         - For Humanities, General Studies, and Conceptual topics (e.g., Geography, History, Indian Polity, General Economics, Ecology): Focus 100% on conceptual clarity, physical mechanisms, features, analytical relationships, and statements. ABSOLUTELY DO NOT invent or force complex mathematical formulas, derivatives, fluid mechanics calculations, or quantitative equations into these questions. Keep it purely aligned to standard GS papers.
         - For Naturally Technical/Quantitative topics (e.g., Pure Mathematics, Physics numericals, Quantitative Chemistry): You are expected to include appropriate formula applications and multi-layered calculations.
         
-        [LATEX FORMATTING]: ONLY if mathematical expressions, core variables, formulas, subscripts (e.g., $\\lambda_1$), or superscripts (e.g., $x^2$) are naturally and legitimately required for the topic, wrap them strictly inside inline LaTeX using single dollar signs ($...$). Do NOT artificially force math symbols or LaTeX notation into strictly conceptual humanities/geography text.
+        [LATEX FORMATTING — MANDATORY, NOT OPTIONAL, WHENEVER MATH NOTATION APPEARS]: Any time your question or options text contains a mathematical symbol, you MUST wrap that entire expression in single dollar signs ($...$) using proper LaTeX commands — never output raw ASCII math shorthand. Concretely:
+        - Powers/exponents: write $x^2$, $\\tan^2\\theta$ — NEVER "x^2" or "tan^2θ" as bare text outside $...$.
+        - Roots: write $\\sqrt{x}$, $\\sqrt{y^2+2xy}$ — NEVER "√(y^2+2xy)" as bare text.
+        - Fractions: write $\\frac{a}{b}$ — NEVER "a/b" when it represents a real fraction/ratio.
+        - Greek letters/trig: write $\\theta$, $\\lambda$, $\\sin\\theta$, $\\cos\\theta$, $\\cot\\theta$ — never bare Unicode glyphs.
+        - Subscripts: write $x_1$, $a_n$ — never "x_1" as plain text.
+        This applies to BOTH the "question" field AND every string inside "options". Do NOT force LaTeX into purely conceptual, non-mathematical humanities/geography text — but the instant ANY exponent, root, fraction-as-ratio, or Greek/trig symbol appears anywhere, wrapping it is a hard requirement with zero exceptions.
         
         [DIFFICULTY CALIBRATION]: Strict Enforcement for "${diffLevel}" level. If difficulty is "Medium", it must strictly match the actual standard core papers of ${targetExam}—make it highly conceptual, analytical, and tricky (ABSOLUTELY NO basic or direct textbook questions). If difficulty is "Tough", make it brutally advanced, elite level, requiring complex structural logic.
         
@@ -126,7 +132,7 @@ app.post('/api/generate-test', async (req, res) => {
         
         [OPTIONS]: Distribute 'correctOptionIndex' randomly across 0,1,2,3.
 
-        [SELF-VERIFICATION — MANDATORY BEFORE FINALIZING EACH QUESTION]: Before finalizing each question, work through this internally: (1) SOLVE: Actually derive the correct answer yourself from first principles for this specific question — compute it, don't assume it (for patterns/ciphers/sequences: apply the rule to EVERY single element/letter and confirm it holds for ALL of them, not just some; for math: do the actual calculation; for facts: confirm accuracy). (2) MATCH: Confirm your derived answer exactly equals the correctOptionIndex option's text/value — not approximately, exactly. (3) EXPLANATION CHECK: Confirm the explanation you are about to write, if followed literally step by step, actually produces YOUR derived answer and no other option. (4) DISTRACTORS: Confirm the 3 wrong options are plausible (reflect common mistakes) but are clearly wrong once your verified derivation is applied. (5) If any check in (1)-(4) fails, discard this draft internally and construct a cleaner question from scratch — do not output anything that fails this verification. Only the final, verified question objects should appear in your output.
+        [SELF-VERIFICATION — MANDATORY BEFORE FINALIZING EACH QUESTION]: Before finalizing each question, work through this internally: (1) SOLVE: Actually derive the correct answer yourself from first principles for this specific question — compute it, don't assume it (for patterns/ciphers/sequences: apply the rule to EVERY single element/letter and confirm it holds for ALL of them, not just some; for math: do the actual calculation; for facts: confirm accuracy). (2) MATCH: Confirm your derived answer exactly equals the correctOptionIndex option's text/value — not approximately, exactly. (3) EXPLANATION CHECK: Confirm the explanation you are about to write, if followed literally step by step, actually produces YOUR derived answer and no other option. (4) DISTRACTORS: Confirm the 3 wrong options are plausible (reflect common mistakes) but are clearly wrong once your verified derivation is applied. (5) LATEX CHECK: Scan your own question and options text for any bare ^, √, Greek letter, or a/b-style fraction that is NOT wrapped in $...$ — if found, fix it before output. (6) If any check in (1)-(5) fails, discard this draft internally and construct a cleaner question from scratch — do not output anything that fails this verification. Only the final, verified question objects should appear in your output.
 
         JSON schema: {"questions": [{"id":0,"question":"","options":["","","",""],"correctOptionIndex":0,"explanation":""}]}.
         Explanation: Max 20 words core fact wrapped in LaTeX where needed.`;
@@ -182,7 +188,7 @@ app.post('/api/generate-test', async (req, res) => {
     }
 
     const finalIndexedQuestions = allCompiledQuestions.slice(0, totalRequested).map((q, index) => ({
-      ...q,
+      ...applyLatexSafetyNet(q),
       id: index
     }));
 
@@ -384,6 +390,89 @@ function wordOverlapRatio(wordsA, wordsB) {
 
 const SIMILARITY_THRESHOLD = 0.75; // tune this later if it's too strict/loose in practice
 
+// ======================================================================
+// 🧮 SAFETY-NET LATEX NORMALIZER
+// The prompt instructs Gemini to wrap all math in $...$, but LLM prompt
+// compliance is never 100% — this is a code-side backstop that catches the
+// most common raw-math patterns it still occasionally leaks (bare "x^2",
+// "√(...)", lone Greek letters) and auto-wraps them, so a missed instruction
+// doesn't reach the student as unrendered "tan^2θ" plain text. This does NOT
+// replace the prompt fix — it's a second line of defense for whatever slips
+// through, since we can never fully guarantee generation-time compliance.
+// ======================================================================
+function autoWrapStrayLatex(text) {
+  if (!text || typeof text !== 'string') return text;
+
+  // Skip segments already inside $...$ so we never double-wrap.
+  const segments = text.split(/(\$[^$]+\$)/g);
+
+  return segments.map(seg => {
+    if (seg.startsWith('$') && seg.endsWith('$')) return seg; // already LaTeX
+
+    let fixed = seg;
+
+    // Build a raw (un-dollar-wrapped) LaTeX form of a chunk of math text —
+    // converts exponents and Greek letters to LaTeX commands WITHOUT adding
+    // $ signs, so it's safe to nest inside \sqrt{...} or other wrappers
+    // without producing invalid nested-$ LaTeX.
+    const toRawLatex = (s) => {
+      let r = s;
+      r = r.replace(/([a-zA-Z0-9αβγθλμπφω]+)\^(\{[^}]+\}|[a-zA-Z0-9]+)/g, (_, base, exp) => {
+        const cleanExp = exp.startsWith('{') ? exp : `{${exp}}`;
+        return `${base}^${cleanExp}`;
+      });
+      r = r.replace(/([θλμπφωΔαβγ])/g, (match) => `\\${greekName(match)}`);
+      return r;
+    };
+
+    // √(...) or √x  ->  $\sqrt{...}$ — process inner content for nested
+    // exponents/Greek letters first, then wrap the WHOLE sqrt expression
+    // in a single pair of $ (never nest $ inside $).
+    fixed = fixed.replace(/√\(([^)]+)\)/g, (_, inner) => `$\\sqrt{${toRawLatex(inner)}}$`);
+    fixed = fixed.replace(/√([a-zA-Z0-9]+)/g, (_, inner) => `$\\sqrt{${toRawLatex(inner)}}$`);
+
+    // Re-split on the sqrt replacements we just made so we don't touch
+    // their contents again in the passes below.
+    const subSegments = fixed.split(/(\$[^$]+\$)/g);
+    fixed = subSegments.map(sub => {
+      if (sub.startsWith('$') && sub.endsWith('$')) return sub; // just-wrapped sqrt, leave alone
+
+      // base^exponent (letters/digits, optional grouped exponent) -> $base^{exponent}$
+      let s = sub.replace(/([a-zA-Z0-9αβγθλμπφω]+)\^(\{[^}]+\}|[a-zA-Z0-9]+)/g, (_, base, exp) => {
+        const cleanExp = exp.startsWith('{') ? exp : `{${exp}}`;
+        return `$${base}^${cleanExp}$`;
+      });
+
+      // Bare Greek letters used as math variables (θ, λ, π, etc.) standing alone
+      s = s.replace(/([θλμπφωΔαβγ])/g, (match) => `$\\${greekName(match)}$`);
+
+      return s;
+    }).join('');
+
+    return fixed;
+  }).join('');
+}
+
+function greekName(ch) {
+  const map = { 'θ': 'theta', 'λ': 'lambda', 'μ': 'mu', 'π': 'pi', 'φ': 'phi', 'ω': 'omega', 'Δ': 'Delta', 'α': 'alpha', 'β': 'beta', 'γ': 'gamma' };
+  return map[ch] || ch;
+}
+
+function applyLatexSafetyNet(question) {
+  if (!question) return question;
+  const patched = { ...question };
+  if (typeof patched.question === 'string') {
+    patched.question = autoWrapStrayLatex(patched.question);
+  }
+  if (Array.isArray(patched.options)) {
+    patched.options = patched.options.map(opt => typeof opt === 'string' ? autoWrapStrayLatex(opt) : opt);
+  }
+  if (typeof patched.explanation === 'string') {
+    patched.explanation = autoWrapStrayLatex(patched.explanation);
+  }
+  return patched;
+}
+
 function isLikelyDuplicate(newQuestion, existingEntries) {
   const newCombinedText = `${newQuestion.question || ""} ${(newQuestion.options || []).join(" ")}`;
   const newWords = normalizeToWords(newCombinedText);
@@ -411,22 +500,44 @@ async function generateFreshQuestionsForPool({ targetExam, targetSubject, target
     ? `Specific Topic Focus: "${targetTopic}".`
     : `No specific narrow topic given — cover general questions broadly across this subject/section.`;
 
-  let exclusionBlock = "";
-  if (exclusionCandidates && exclusionCandidates.length > 0) {
-    const exclusionLines = exclusionCandidates.slice(0, 100).map((q, i) => {
+  // 🚨 buildExclusionBlock is now a function, not a one-time string — it gets
+  // rebuilt on every chunk iteration so that questions generated in EARLIER
+  // chunks of THIS SAME request are also fed back in as exclusions. Previously
+  // this block was built once before the while-loop from only the pre-existing
+  // pool rows, so chunk 2 (Qs 16-30) had zero awareness of chunk 1 (Qs 1-15)
+  // and could — and did — regenerate the exact same questions.
+  function buildExclusionBlock(entries) {
+    if (!entries || entries.length === 0) return "";
+    // Keep the most recent 50 to bound prompt size even as this list grows
+    // across chunk iterations within a single large request.
+    const trimmed = entries.slice(-50);
+    const exclusionLines = trimmed.map((q, i) => {
       const optsText = Array.isArray(q.options) ? ` Options: ${q.options.join(' | ')}` : '';
       return `${i + 1}. ${q.question_text}${optsText}`;
     }).join('\n');
-    exclusionBlock = `\n\n[DO NOT REPEAT — EXISTING QUESTIONS IN POOL]\nThese questions already exist for this exact exam/subject/topic/difficulty combination. Do NOT generate anything testing the same underlying concept, even if reworded differently:\n${exclusionLines}\n`;
+    return `\n\n[DO NOT REPEAT — EXISTING QUESTIONS IN POOL AND ALREADY GENERATED IN THIS SESSION]\nThese questions already exist for this exact exam/subject/topic/difficulty combination (including ones generated moments ago in an earlier chunk of this very same request). Do NOT generate anything testing the same underlying concept, even if reworded differently:\n${exclusionLines}\n`;
   }
+
+  // Running list that starts with pre-existing pool candidates and grows with
+  // every freshly generated + accepted question across chunk iterations.
+  let runningExclusionEntries = [...(exclusionCandidates || [])];
 
   const MAX_CHUNK_SIZE = 15;
   let allCompiled = [];
-  let remaining = count;
+  // 🚨 Loop now continues until we actually HAVE `count` accepted questions,
+  // not just until we've made ceil(count/15) request-chunks. Since duplicates
+  // get discarded inside the loop (see below), requesting a fixed chunk size
+  // per iteration no longer guarantees enough survive — so we track shortfall
+  // against allCompiled.length instead of decrementing a fixed `remaining`.
+  let attempts = 0;
+  const MAX_ATTEMPTS = 6; // safety cap so a stubborn topic can't loop forever
 
-  while (remaining > 0) {
-    const chunkSize = Math.min(MAX_CHUNK_SIZE, remaining);
+  while (allCompiled.length < count && attempts < MAX_ATTEMPTS) {
+    attempts++;
+    const stillNeeded = count - allCompiled.length;
+    const chunkSize = Math.min(MAX_CHUNK_SIZE, stillNeeded);
     const sessionSeed = Math.random().toString(36).substring(7);
+    const exclusionBlock = buildExclusionBlock(runningExclusionEntries);
 
     let prompt = "";
     if (qType === 'Subjective') {
@@ -447,10 +558,18 @@ ${exclusionBlock}
 
 [OPTIONS]: Distribute 'correctOptionIndex' randomly across 0,1,2,3.
 
-[SELF-VERIFICATION — MANDATORY BEFORE FINALIZING EACH QUESTION]: Before finalizing each question, work through this internally: (1) SOLVE: Actually derive the correct answer yourself from first principles for this specific question — compute it, don't assume it (for patterns/ciphers/sequences: apply the rule to EVERY single element/letter and confirm it holds for ALL of them, not just some; for math: do the actual calculation; for facts: confirm accuracy). (2) MATCH: Confirm your derived answer exactly equals the correctOptionIndex option's text/value — not approximately, exactly. (3) EXPLANATION CHECK: Confirm the explanation you are about to write, if followed literally step by step, actually produces YOUR derived answer and no other option. (4) DISTRACTORS: Confirm the 3 wrong options are plausible (reflect common mistakes) but are clearly wrong once your verified derivation is applied. (5) If any check in (1)-(4) fails, discard this draft internally and construct a cleaner question from scratch — do not output anything that fails this verification. Only the final, verified question objects should appear in your output.
+[LATEX FORMATTING — MANDATORY, NOT OPTIONAL, WHENEVER MATH NOTATION APPEARS]: Any time your question or options text contains a mathematical symbol, you MUST wrap that entire expression in single dollar signs ($...$) using proper LaTeX commands — never output raw ASCII math shorthand. Concretely:
+- Powers/exponents: write $x^2$, $\\tan^2\\theta$ — NEVER "x^2" or "tan^2θ" as bare text outside $...$.
+- Roots: write $\\sqrt{x}$, $\\sqrt{y^2+2xy}$ — NEVER "√(y^2+2xy)" as bare text.
+- Fractions: write $\\frac{a}{b}$ — NEVER "a/b" when it represents a real fraction/ratio (plain sentence fractions like "half of the class" are fine as text).
+- Greek letters/trig: write $\\theta$, $\\lambda$, $\\sin\\theta$, $\\cos\\theta$, $\\cot\\theta$ — never the bare Unicode glyphs.
+- Subscripts: write $x_1$, $a_n$ — never "x_1" as plain text.
+This applies to BOTH the "question" field AND every string inside "options" — if an option is a formula like √(y²+2xy)/(x+y), it must be output as the LaTeX string "$\\sqrt{y^2+2xy}/(x+y)$", not as raw symbols. If a topic is purely conceptual with zero math, do not force LaTeX into it — but the instant ANY exponent, root, fraction-as-ratio, or Greek/trig symbol appears anywhere in the question or options, it is a hard requirement to wrap it, with zero exceptions.
+
+[SELF-VERIFICATION — MANDATORY BEFORE FINALIZING EACH QUESTION]: Before finalizing each question, work through this internally: (1) SOLVE: Actually derive the correct answer yourself from first principles for this specific question — compute it, don't assume it (for patterns/ciphers/sequences: apply the rule to EVERY single element/letter and confirm it holds for ALL of them, not just some; for math: do the actual calculation; for facts: confirm accuracy). (2) MATCH: Confirm your derived answer exactly equals the correctOptionIndex option's text/value — not approximately, exactly. (3) EXPLANATION CHECK: Confirm the explanation you are about to write, if followed literally step by step, actually produces YOUR derived answer and no other option. (4) DISTRACTORS: Confirm the 3 wrong options are plausible (reflect common mistakes) but are clearly wrong once your verified derivation is applied. (5) LATEX CHECK: Scan your own question and options text for any bare ^, √, Greek letter, or a/b-style fraction that is NOT wrapped in $...$ — if found, fix it before output. (6) If any check in (1)-(5) fails, discard this draft internally and construct a cleaner question from scratch — do not output anything that fails this verification. Only the final, verified question objects should appear in your output.
 
 JSON schema: {"questions": [{"question":"","options":["","","",""],"correctOptionIndex":0,"explanation":""}]}.
-Explanation: Max 20 words core fact.`;
+Explanation: Max 20 words core fact wrapped in LaTeX where needed.`;
     }
 
     let retries = 3;
@@ -474,9 +593,24 @@ Explanation: Max 20 words core fact.`;
     }
 
     if (parsedData?.questions?.length) {
-      allCompiled = [...allCompiled, ...parsedData.questions];
+      // 🚨 Per-question duplicate check happens HERE now, immediately after
+      // each chunk, against the running exclusion list (pool history +
+      // everything accepted so far in this request). This is what actually
+      // stops chunk 2 from repeating chunk 1 — filtering only at the very
+      // end (as build-test's outer isLikelyDuplicate pass does) was too late,
+      // since by then both chunks were already merged and it only compared
+      // against pool history, not against each other.
+      for (const rawQ of parsedData.questions) {
+        const asPoolShape = { question_text: rawQ.question, options: rawQ.options };
+        if (isLikelyDuplicate(asPoolShape, runningExclusionEntries)) {
+          console.warn("⚠️ Discarded an intra-request duplicate (matched an earlier chunk or pool history).");
+          continue;
+        }
+        const q = applyLatexSafetyNet(rawQ);
+        allCompiled.push(q);
+        runningExclusionEntries.push({ question_text: q.question, options: q.options });
+      }
     }
-    remaining -= chunkSize;
   }
 
   return allCompiled.slice(0, count);
@@ -552,7 +686,7 @@ app.post('/api/pool/serve-questions', async (req, res) => {
         .eq('subject', targetSubject)
         .eq('type', qType)
         .order('created_at', { ascending: false })
-        .limit(100);
+        .limit(50);
       if (exclErr) throw exclErr;
 
       const freshQuestions = await generateFreshQuestionsForPool({
@@ -799,7 +933,7 @@ app.post('/api/pool/build-test', async (req, res) => {
         .eq('subject', targetSubject)
         .eq('type', qType)
         .order('created_at', { ascending: false })
-        .limit(100);
+        .limit(50);
       if (exclErr) throw exclErr;
 
       const freshQuestions = await generateFreshQuestionsForPool({
