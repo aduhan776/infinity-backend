@@ -530,7 +530,12 @@ async function generateFreshQuestionsForPool({ targetExam, targetSubject, target
   // per iteration no longer guarantees enough survive — so we track shortfall
   // against allCompiled.length instead of decrementing a fixed `remaining`.
   let attempts = 0;
-  const MAX_ATTEMPTS = 6; // safety cap so a stubborn topic can't loop forever
+  // 🚨 Scales with `count` instead of a fixed 6 — a fixed cap meant a single
+  // 15-question batch had only 1 "ideal" attempt of slack, so a high Gemini
+  // duplicate-discard rate could exhaust MAX_ATTEMPTS before reaching count.
+  // Formula gives at least double the "ideal" number of chunks as headroom,
+  // while still bailing out eventually so a stubborn topic can't loop forever.
+  const MAX_ATTEMPTS = Math.max(6, Math.ceil(count / MAX_CHUNK_SIZE) * 2);
 
   while (allCompiled.length < count && attempts < MAX_ATTEMPTS) {
     attempts++;
@@ -863,7 +868,7 @@ app.post('/api/pool/toggle-save', async (req, res) => {
 // ======================================================================
 app.post('/api/pool/build-test', async (req, res) => {
   try {
-    const { studentId, exam, subject, topic, difficulty, type, count, language, origin, revealAnswers, skipResurfacing } = req.body;
+    const { studentId, exam, subject, topic, difficulty, type, count, language, origin, revealAnswers, skipResurfacing, excludeIds } = req.body;
 
     if (!studentId) return res.status(400).json({ success: false, error: "studentId missing bhai!" });
     if (!subject) return res.status(400).json({ success: false, error: "Subject/Section missing bhai!" });
@@ -875,7 +880,20 @@ app.post('/api/pool/build-test', async (req, res) => {
     const qType = type || "Objective";
     const lang = language || "English";
     const rawRequested = parseInt(count) || 5;
-    const totalRequested = Math.min(50, Math.max(1, rawRequested));
+    // 🚨 Cap raised from 50 -> 200 to support full-length mock papers (e.g.
+    // SSC CPO/CGL/CHSL run 100-200 questions). AI Labs currently only ever
+    // sends up to 15 per call (client-side batching loop), so this mainly
+    // future-proofs any caller that requests a larger count in one shot.
+    const totalRequested = Math.min(200, Math.max(1, rawRequested));
+
+    // 🚨 excludeIds: question_pool row IDs already served earlier in THIS
+    // SAME generation session (e.g. AI Labs' batching loop calls build-test
+    // once per 15 questions for a 200-question paper). Without this, every
+    // subsequent batch call re-runs the same pool query, finds the previous
+    // batch's freshly-inserted rows sitting as "unseen" (no ledger entry yet
+    // since the student hasn't attempted them), and re-serves them instead
+    // of generating new ones — DB stays stuck at 15 rows, same set repeats.
+    const excludeIdSet = new Set(Array.isArray(excludeIds) ? excludeIds : []);
 
     // STEP 1: Pull candidate pool rows matching this exact tag combination.
     let poolQuery = supabase
@@ -888,8 +906,14 @@ app.post('/api/pool/build-test', async (req, res) => {
 
     poolQuery = targetTopic ? poolQuery.eq('topic', targetTopic) : poolQuery.is('topic', null);
 
-    const { data: candidatePool, error: poolErr } = await poolQuery.limit(500);
+    const { data: rawCandidatePool, error: poolErr } = await poolQuery.limit(500);
     if (poolErr) throw poolErr;
+
+    // Filtered in JS (not via a Supabase .not('id','in',...) clause) so an
+    // empty/undefined excludeIds array is always a safe no-op.
+    const candidatePool = excludeIdSet.size > 0
+      ? (rawCandidatePool || []).filter(q => !excludeIdSet.has(q.id))
+      : (rawCandidatePool || []);
 
     // STEP 2: Ledger check — same resurfacing rule as serve-questions.
     const poolIds = (candidatePool || []).map(q => q.id);
