@@ -126,6 +126,8 @@ app.post('/api/generate-test', async (req, res) => {
         - Subscripts: write $x_1$, $a_n$ — never "x_1" as plain text.
         This applies to BOTH the "question" field AND every string inside "options". Do NOT force LaTeX into purely conceptual, non-mathematical humanities/geography text — but the instant ANY exponent, root, fraction-as-ratio, or Greek/trig symbol appears anywhere, wrapping it is a hard requirement with zero exceptions.
         
+        [JSON ESCAPE SAFETY — CRITICAL, APPLIES TO YOUR RAW OUTPUT]: Your entire response is parsed as JSON. Any backslash you write inside a JSON string value MUST be a DOUBLE backslash (\\\\), never a single one — this applies to every LaTeX command (write \\\\frac not \\frac, \\\\sqrt not \\sqrt, \\\\theta not \\theta) and to any other backslash-like character. A single backslash before certain letters (like f, n, t, b, r) breaks JSON parsing or silently corrupts your own output. Also, for non-LaTeX content (e.g. geography coordinates, degree-minute-second notation like 23°26'22", or apostrophes in words like "Earth's"), never insert a backslash before the apostrophe or quote character — write it as a plain straight character; do NOT write \\' or \\".
+        
         [DIFFICULTY CALIBRATION]: Strict Enforcement for "${diffLevel}" level. If difficulty is "Medium", it must strictly match the actual standard core papers of ${targetExam}—make it highly conceptual, analytical, and tricky (ABSOLUTELY NO basic or direct textbook questions). If difficulty is "Tough", make it brutally advanced, elite level, requiring complex structural logic.
         
         [STRUCTURE]: For multi-statement, matching, or list-based questions, do NOT lump statements into one paragraph. You MUST format statements as a clean numbered vertical list (e.g., "Consider the following statements:\\n\\n1. [Statement 1]\\n\\n2. [Statement 2]") with explicit double escaped newlines (\\n\\n) after each item so the frontend renders them beautifully.
@@ -170,7 +172,8 @@ app.post('/api/generate-test', async (req, res) => {
           if (startBrace === -1 || endBrace === -1) {
             throw new Error("Invalid structured AI text response mapping stream.");
           }
-          parsedData = JSON.parse(responseText.substring(startBrace, endBrace + 1));
+          const rawJsonSlice = responseText.substring(startBrace, endBrace + 1);
+          parsedData = JSON.parse(sanitizeJsonEscapes(rawJsonSlice));
           break;
         } catch (err) {
           retries--;
@@ -458,6 +461,66 @@ function greekName(ch) {
   return map[ch] || ch;
 }
 
+// ======================================================================
+// 🛡️ SAFETY NET: Sanitize broken backslash escapes in raw Gemini output
+// BEFORE JSON.parse() runs.
+//
+// Why this exists: Gemini is instructed to output LaTeX (e.g. \frac{1}{2},
+// \sqrt{x}, \theta) inside JSON string values. Valid JSON requires those
+// backslashes to be DOUBLED (\\frac) so that after parsing, a single
+// backslash survives. When Gemini forgets to double them, two failure
+// modes happen:
+//   1) The single backslash + next letter accidentally forms a JSON-
+//      RESERVED escape (\f = form-feed, \t = tab, \n = newline, etc).
+//      JSON.parse() silently "succeeds" but SWALLOWS the backslash and
+//      that one letter, corrupting output — e.g. "\frac{1}{2}" parses
+//      into "rac{1}{2}" because \f is consumed as a lone form-feed char.
+//   2) The single backslash + next char is NOT a valid JSON escape at
+//      all (e.g. a stray \' from an apostrophe). JSON.parse() throws
+//      "Bad escaped character in JSON at position X" and the whole
+//      generation call crashes (this is the AI Labs error case).
+//
+// NOTE: We deliberately do NOT try to blanket-detect "any backslash not
+// already a valid JSON escape" — that's ambiguous, because \f, \t, \n etc.
+// are simultaneously valid standalone JSON escapes AND the first letter of
+// legitimate LaTeX commands (\frac, \tan, \newcommand...). There's no way
+// to tell those apart generically. Instead we target the two KNOWN, real
+// failure sources directly:
+//   (a) A known finite list of LaTeX command names Gemini is instructed
+//       to use — double the backslash only when one of these follows it.
+//   (b) A stray \' (backslash-apostrophe), which is never valid JSON and
+//       always represents an over-escaped apostrophe — the backslash is
+//       simply dropped, restoring the plain apostrophe.
+// ======================================================================
+function sanitizeJsonEscapes(rawText) {
+  if (typeof rawText !== 'string') return rawText;
+
+  const knownLatexCommands = [
+    'dfrac', 'frac', 'sqrt', 'theta', 'lambda', 'omega', 'Omega', 'Delta',
+    'delta', 'alpha', 'beta', 'gamma', 'Gamma', 'tan', 'sin', 'cos', 'cot',
+    'sec', 'csc', 'ln', 'log', 'times', 'div', 'cdot', 'circ', 'infty',
+    'leq', 'geq', 'neq', 'approx', 'rightarrow', 'leftarrow', 'Rightarrow',
+    'sum', 'int', 'partial', 'nabla', 'vec', 'hat', 'bar', 'overline',
+    'underline', 'text', 'left', 'right', 'mu', 'pi', 'phi'
+  ].sort((a, b) => b.length - a.length); // longest-first so "dfrac" wins over "frac"
+  const cmdPattern = knownLatexCommands.join('|');
+
+  let out = rawText;
+
+  // 1) Double any single backslash immediately followed by a known LaTeX
+  //    command name (skip ones already doubled, via negative lookbehind).
+  const latexRegex = new RegExp(`(?<!\\\\)\\\\(${cmdPattern})`, 'g');
+  out = out.replace(latexRegex, '\\\\$1');
+
+  // 2) A stray \' is never valid JSON — it almost always means Gemini
+  //    over-escaped a plain apostrophe (e.g. in "Earth's"). Drop the
+  //    backslash entirely rather than doubling it, restoring the intended
+  //    plain apostrophe character.
+  out = out.replace(/(?<!\\)\\'/g, "'");
+
+  return out;
+}
+
 function applyLatexSafetyNet(question) {
   if (!question) return question;
   const patched = { ...question };
@@ -571,6 +634,8 @@ ${exclusionBlock}
 - Subscripts: write $x_1$, $a_n$ — never "x_1" as plain text.
 This applies to BOTH the "question" field AND every string inside "options" — if an option is a formula like √(y²+2xy)/(x+y), it must be output as the LaTeX string "$\\sqrt{y^2+2xy}/(x+y)$", not as raw symbols. If a topic is purely conceptual with zero math, do not force LaTeX into it — but the instant ANY exponent, root, fraction-as-ratio, or Greek/trig symbol appears anywhere in the question or options, it is a hard requirement to wrap it, with zero exceptions.
 
+[JSON ESCAPE SAFETY — CRITICAL, APPLIES TO YOUR RAW OUTPUT]: Your entire response is parsed as JSON. Any backslash you write inside a JSON string value MUST be a DOUBLE backslash (\\\\), never a single one — this applies to every LaTeX command (write \\\\frac not \\frac, \\\\sqrt not \\sqrt, \\\\theta not \\theta) and to any other backslash-like character. A single backslash before certain letters (like f, n, t, b, r) breaks JSON parsing or silently corrupts your own output. Also, for non-LaTeX content (e.g. geography coordinates, degree-minute-second notation like 23°26'22", or apostrophes in words like "Earth's"), never insert a backslash before the apostrophe or quote character — write it as a plain straight character; do NOT write \\' or \\".
+
 [SELF-VERIFICATION — MANDATORY BEFORE FINALIZING EACH QUESTION]: Before finalizing each question, work through this internally: (1) SOLVE: Actually derive the correct answer yourself from first principles for this specific question — compute it, don't assume it (for patterns/ciphers/sequences: apply the rule to EVERY single element/letter and confirm it holds for ALL of them, not just some; for math: do the actual calculation; for facts: confirm accuracy). (2) MATCH: Confirm your derived answer exactly equals the correctOptionIndex option's text/value — not approximately, exactly. (3) EXPLANATION CHECK: Confirm the explanation you are about to write, if followed literally step by step, actually produces YOUR derived answer and no other option. (4) DISTRACTORS: Confirm the 3 wrong options are plausible (reflect common mistakes) but are clearly wrong once your verified derivation is applied. (5) LATEX CHECK: Scan your own question and options text for any bare ^, √, Greek letter, or a/b-style fraction that is NOT wrapped in $...$ — if found, fix it before output. (6) If any check in (1)-(5) fails, discard this draft internally and construct a cleaner question from scratch — do not output anything that fails this verification. Only the final, verified question objects should appear in your output.
 
 JSON schema: {"questions": [{"question":"","options":["","","",""],"correctOptionIndex":0,"explanation":""}]}.
@@ -588,7 +653,8 @@ Explanation: Max 20 words core fact wrapped in LaTeX where needed.`;
         const startBrace = responseText.indexOf('{');
         const endBrace = responseText.lastIndexOf('}');
         if (startBrace === -1 || endBrace === -1) throw new Error("Invalid AI response structure.");
-        parsedData = JSON.parse(responseText.substring(startBrace, endBrace + 1));
+        const rawJsonSlice = responseText.substring(startBrace, endBrace + 1);
+        parsedData = JSON.parse(sanitizeJsonEscapes(rawJsonSlice));
         break;
       } catch (err) {
         retries--;
