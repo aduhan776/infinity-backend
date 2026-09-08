@@ -1326,7 +1326,7 @@ app.get('/api/tests/browse', async (req, res) => {
   try {
     const { data, error } = await supabase
       .from('mock_tests')
-      .select('id, category_name, series_name, sub_section, title, questions, time, has_sectional_timing, created_at')
+      .select('id, category_name, series_name, sub_section, sub_group, title, questions, time, has_sectional_timing, created_at')
       .order('created_at', { ascending: false });
 
     if (error) throw error;
