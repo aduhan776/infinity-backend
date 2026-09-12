@@ -49,6 +49,37 @@ const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 //      since RLS can only block/allow whole rows, not individual columns.
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
 
+// 🛡️ AUTH VERIFICATION MIDDLEWARE
+// This replaces trusting a client-sent `studentId` in the request body.
+// Frontend must send: Authorization: Bearer <supabase_session_access_token>
+// This middleware verifies that token with Supabase itself, and only then
+// sets req.verifiedUserId to the REAL user id — which the rest of the route
+// handler must use instead of req.body.studentId.
+async function requireAuth(req, res, next) {
+  try {
+    const authHeader = req.headers.authorization || '';
+    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+
+    if (!token) {
+      return res.status(401).json({ success: false, error: "Login required (missing auth token)." });
+    }
+
+    // Ask Supabase: "who does this token actually belong to?"
+    const { data, error } = await supabase.auth.getUser(token);
+
+    if (error || !data?.user) {
+      return res.status(401).json({ success: false, error: "Invalid or expired session. Please log in again." });
+    }
+
+    // This is now the ONLY source of truth for user identity in this request.
+    req.verifiedUserId = data.user.id;
+    next();
+  } catch (err) {
+    console.error("Auth middleware error:", err);
+    return res.status(401).json({ success: false, error: "Authentication check failed." });
+  }
+}
+
 function makeGenerativePart(base64DataUrl) {
   const match = base64DataUrl.match(/^data:(.*);base64,(.*)$/);
   if (!match) return null;
@@ -69,7 +100,7 @@ app.get('/', (req, res) => {
 // (UNCHANGED — kept exactly as-is, still used wherever pool-based
 //  serving isn't wired in yet, or for one-off generation needs)
 // ======================================================================
-app.post('/api/generate-test', async (req, res) => {
+app.post('/api/generate-test', requireAuth, async (req, res) => {
   try {
     const { exam, subject, topic, count, type, difficulty, language } = req.body;
 
@@ -217,9 +248,10 @@ app.post('/api/generate-test', async (req, res) => {
 // 📝 ROUTE 2: MULTIMODAL SUBJECTIVE EVALUATION GATEWAY
 // (UNCHANGED)
 // ======================================================================
-app.post('/api/evaluate-subjective', async (req, res) => {
+app.post('/api/evaluate-subjective', requireAuth, async (req, res) => {
   try {
-    const { question, userAnswer, uploadedFiles, testTitle, maxMarks, studentId, questionId } = req.body;
+    const studentId = req.verifiedUserId; // ✅ server-verified
+    const { question, userAnswer, uploadedFiles, testTitle, maxMarks, questionId } = req.body;
 
     if (!question) {
       return res.status(400).json({ success: false, error: "Question metadata reference is missing!" });
@@ -693,11 +725,11 @@ Explanation: Max 20 words core fact wrapped in LaTeX where needed.`;
 // Answers are ALWAYS stripped before the response leaves this route —
 // this is where "Layer 2" of the answer-hiding security actually lives.
 // ======================================================================
-app.post('/api/pool/serve-questions', async (req, res) => {
+app.post('/api/pool/serve-questions', requireAuth, async (req, res) => {
   try {
-    const { studentId, exam, subject, topic, difficulty, type, count, language, origin } = req.body;
+    const studentId = req.verifiedUserId; // ✅ server-verified, never trust req.body.studentId again
+    const { exam, subject, topic, difficulty, type, count, language, origin } = req.body;
 
-    if (!studentId) return res.status(400).json({ success: false, error: "studentId missing bhai!" });
     if (!subject) return res.status(400).json({ success: false, error: "Subject/Section missing bhai!" });
 
     const targetExam = normalizeTag(exam) || "COMPETITIVE EXAM";
@@ -833,12 +865,13 @@ app.post('/api/pool/serve-questions', async (req, res) => {
 // unique constraint on the table. Only place correct_option_index /
 // explanation get sent back to the frontend is AFTER this call.
 // ======================================================================
-app.post('/api/pool/submit-attempt', async (req, res) => {
+app.post('/api/pool/submit-attempt', requireAuth, async (req, res) => {
   try {
-    const { studentId, questionId, selectedOptionIndex } = req.body;
+    const studentId = req.verifiedUserId; // ✅ server-verified
+    const { questionId, selectedOptionIndex } = req.body;
 
-    if (!studentId || !questionId) {
-      return res.status(400).json({ success: false, error: "studentId or questionId missing." });
+    if (!questionId) {
+      return res.status(400).json({ success: false, error: "questionId missing." });
     }
 
     const { data: questionRow, error: qErr } = await supabase
@@ -895,12 +928,13 @@ app.post('/api/pool/submit-attempt', async (req, res) => {
 // (product decision) — so this just updates the existing ledger row,
 // it never creates one.
 // ======================================================================
-app.post('/api/pool/toggle-save', async (req, res) => {
+app.post('/api/pool/toggle-save', requireAuth, async (req, res) => {
   try {
-    const { studentId, questionId, saved } = req.body;
+    const studentId = req.verifiedUserId; // ✅ server-verified
+    const { questionId, saved } = req.body;
 
-    if (!studentId || !questionId || typeof saved !== 'boolean') {
-      return res.status(400).json({ success: false, error: "studentId, questionId and saved (boolean) are all required." });
+    if (!questionId || typeof saved !== 'boolean') {
+      return res.status(400).json({ success: false, error: "questionId and saved (boolean) are required." });
     }
 
     const { data, error } = await supabase
@@ -932,11 +966,11 @@ app.post('/api/pool/toggle-save', async (req, res) => {
 // (server-side only) so grading has something to check against.
 // Supports both Objective and Subjective question types.
 // ======================================================================
-app.post('/api/pool/build-test', async (req, res) => {
+app.post('/api/pool/build-test', requireAuth, async (req, res) => {
   try {
-    const { studentId, exam, subject, topic, difficulty, type, count, language, origin, revealAnswers, skipResurfacing, excludeIds } = req.body;
+    const studentId = req.verifiedUserId; // ✅ server-verified
+    const { exam, subject, topic, difficulty, type, count, language, origin, revealAnswers, skipResurfacing, excludeIds } = req.body;
 
-    if (!studentId) return res.status(400).json({ success: false, error: "studentId missing bhai!" });
     if (!subject) return res.status(400).json({ success: false, error: "Subject/Section missing bhai!" });
 
     const targetExam = normalizeTag(exam) || "COMPETITIVE EXAM";
@@ -1112,11 +1146,9 @@ app.post('/api/pool/build-test', async (req, res) => {
 // full question text/options/explanation come back in one call — safe to
 // show full answer data here since these are ALWAYS post-attempt saves.
 // ======================================================================
-app.get('/api/pool/saved-questions', async (req, res) => {
+app.get('/api/pool/saved-questions', requireAuth, async (req, res) => {
   try {
-    const { studentId } = req.query;
-
-    if (!studentId) return res.status(400).json({ success: false, error: "studentId missing bhai!" });
+    const studentId = req.verifiedUserId; // ✅ server-verified
 
     const { data, error } = await supabase
       .from('attempts_ledger')
@@ -1164,9 +1196,10 @@ app.get('/api/pool/saved-questions', async (req, res) => {
 //      design — admin owns those answers directly).
 // Also logs pool ledger entries for anything resolved via the pool.
 // ======================================================================
-app.post('/api/pool/grade-test', async (req, res) => {
+app.post('/api/pool/grade-test', requireAuth, async (req, res) => {
   try {
-    const { studentId, testId, answers } = req.body;
+    const studentId = req.verifiedUserId; // ✅ server-verified
+    const { testId, answers } = req.body;
 
     if (!Array.isArray(answers) || answers.length === 0) {
       return res.json({ success: true, results: [], totalScore: 0, correctCount: 0, incorrectCount: 0 });
