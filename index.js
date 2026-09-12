@@ -1184,6 +1184,66 @@ app.get('/api/pool/saved-questions', requireAuth, async (req, res) => {
 });
 
 // ======================================================================
+// 🎯 ROUTE (NEW): FETCH question_pool ROWS BY ID — for AnalysisPortal
+// AnalysisPortal reconstructs a completed AI Labs attempt's full question
+// content (text/options/correct answer/explanation) from the question_ids
+// array already stored in test_sessions. It used to do this via a direct
+// frontend Supabase client query — but question_pool has RLS enabled with
+// ZERO policies defined, so that direct client query always silently
+// returned zero rows (this is the same lockdown pattern already applied
+// deliberately to mock_tests for regular students). This route does the
+// same lookup server-side using the service-role key, which bypasses RLS,
+// matching the same cloud-based pattern already used by /api/tests/load.
+// Ownership check: only returns pool rows for question_ids the student
+// actually owns via a completed test_sessions row (prevents an authenticated
+// user from fetching arbitrary pool content by guessing/enumerating ids).
+// ======================================================================
+app.post('/api/pool/questions-by-ids', requireAuth, async (req, res) => {
+  try {
+    const studentId = req.verifiedUserId; // ✅ server-verified
+    const { attemptId, questionIds } = req.body;
+
+    if (!attemptId || !Array.isArray(questionIds) || questionIds.length === 0) {
+      return res.status(400).json({ success: false, error: "attemptId and a non-empty questionIds array are required." });
+    }
+
+    // Ownership check — this attempt must belong to the verified student.
+    const { data: sessionRow, error: sessionErr } = await supabase
+      .from('test_sessions')
+      .select('id, user_id, question_ids')
+      .eq('id', attemptId)
+      .eq('user_id', studentId)
+      .single();
+
+    if (sessionErr || !sessionRow) {
+      return res.status(403).json({ success: false, error: "This attempt does not belong to you, or could not be found." });
+    }
+
+    // Only ever fetch ids that are actually part of this owned attempt —
+    // never trust the questionIds array from the client body blindly.
+    const ownedIds = new Set((sessionRow.question_ids || []).map(String));
+    const safeIds = questionIds.filter(id => ownedIds.has(String(id)));
+
+    if (safeIds.length === 0) {
+      return res.json({ success: true, questions: [] });
+    }
+
+    const { data: poolRows, error: poolErr } = await supabase
+      .from('question_pool')
+      .select('*')
+      .in('id', safeIds);
+
+    if (poolErr) throw poolErr;
+
+    res.json({ success: true, questions: poolRows || [] });
+
+  } catch (error) {
+    console.error("❌ Questions-By-Ids Fetch Error:", error);
+    res.status(500).json({ success: false, error: error.message || "Failed to fetch question content." });
+  }
+});
+
+// ======================================================================
 // 🎯 ROUTE 8 (NEW): GRADE A TEST — "Secure Test Delivery"
 // TestPortal sends back {questionId, selectedOptionIndex, marks, neg} for
 // every attempted Objective question — NEVER the answer itself, since it
