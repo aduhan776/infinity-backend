@@ -1244,6 +1244,45 @@ app.post('/api/pool/questions-by-ids', requireAuth, async (req, res) => {
 });
 
 // ======================================================================
+// 🎯 ROUTE (NEW): SIGNED URLS FOR PRIVATE SUBJECTIVE UPLOADS
+// The 'subjective-uploads' Storage bucket is private (handwritten answer
+// sheets are personal student content). AnalysisPortal only has the
+// storage PATH (e.g. "{user_id}/{attemptId}/{q}_{i}_{name}") — it can't
+// render that directly, so it asks this route for a short-lived signed
+// URL. Ownership check: the path's first segment must equal the verified
+// user's own id, since paths are always written as {user_id}/... — this
+// stops one student from requesting another student's image path.
+// ======================================================================
+app.post('/api/storage/signed-url', requireAuth, async (req, res) => {
+  try {
+    const studentId = req.verifiedUserId; // ✅ server-verified
+    const { path } = req.body;
+
+    if (!path || typeof path !== 'string') {
+      return res.status(400).json({ success: false, error: "path is required." });
+    }
+
+    const ownerSegment = path.split('/')[0];
+    if (ownerSegment !== studentId) {
+      return res.status(403).json({ success: false, error: "This file does not belong to you." });
+    }
+
+    const { data, error } = await supabase
+      .storage
+      .from('subjective-uploads')
+      .createSignedUrl(path, 60 * 10); // 10 minutes — plenty for viewing in AnalysisPortal
+
+    if (error) throw error;
+
+    res.json({ success: true, signedUrl: data.signedUrl });
+
+  } catch (error) {
+    console.error("❌ Signed URL Generation Error:", error);
+    res.status(500).json({ success: false, error: error.message || "Failed to generate signed URL." });
+  }
+});
+
+// ======================================================================
 // 🎯 ROUTE 8 (NEW): GRADE A TEST — "Secure Test Delivery"
 // TestPortal sends back {questionId, selectedOptionIndex, marks, neg} for
 // every attempted Objective question — NEVER the answer itself, since it
