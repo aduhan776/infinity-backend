@@ -80,6 +80,58 @@ async function requireAuth(req, res, next) {
   }
 }
 
+// 🚦 PER-MINUTE RATE LIMITING (in-memory, per verified user)
+// This is a burst-friendly cap — NOT a per-call cooldown. A single user
+// action (e.g. generating a 100-question paper, or submitting a test with
+// many Subjective questions) can legitimately fire several sequential
+// batch calls in a few seconds. A flat "N seconds between any two calls"
+// cooldown would make that impossible. Instead we cap total calls to a
+// route within a rolling 60-second window per user — bursts are fine,
+// sustained abuse is not. Pre-paid model: the student has already paid
+// for their credit balance before any of these routes run, so this exists
+// to protect infra/Gemini-side rate limits, not to prevent revenue loss.
+// In-memory is sufficient here — if the server restarts, counters simply
+// reset, which is an acceptable (and rare) edge case for a soft cap.
+const rateLimitBuckets = new Map(); // key: `${routeName}:${userId}` -> { count, windowStart }
+
+function createPerMinuteRateLimit(routeName, maxCallsPerMinute) {
+  return function rateLimit(req, res, next) {
+    const userId = req.verifiedUserId;
+    const key = `${routeName}:${userId}`;
+    const now = Date.now();
+    const windowMs = 60 * 1000;
+
+    const bucket = rateLimitBuckets.get(key);
+
+    if (!bucket || now - bucket.windowStart >= windowMs) {
+      // Fresh window.
+      rateLimitBuckets.set(key, { count: 1, windowStart: now });
+      return next();
+    }
+
+    if (bucket.count >= maxCallsPerMinute) {
+      const secondsLeft = Math.ceil((windowMs - (now - bucket.windowStart)) / 1000);
+      return res.status(429).json({
+        success: false,
+        error: `Too many requests — please wait ${secondsLeft}s before trying again.`
+      });
+    }
+
+    bucket.count += 1;
+    next();
+  };
+}
+
+const rateLimitBuildTest = createPerMinuteRateLimit('build-test', 20);
+const rateLimitEvaluateSubjective = createPerMinuteRateLimit('evaluate-subjective', 10);
+
+// 🔒 IDEMPOTENCY LOCK for evaluate-subjective (prevents duplicate-submit
+// spam — e.g. a double-tapped Submit button, or a network retry — from
+// triggering a second Gemini evaluation for the SAME attempt while the
+// first one is still being processed). Keyed on attemptId, since a whole
+// batch of subjective questions for one submit shares one attemptId.
+const processingAttempts = new Set();
+
 function makeGenerativePart(base64DataUrl) {
   const match = base64DataUrl.match(/^data:(.*);base64,(.*)$/);
   if (!match) return null;
@@ -245,68 +297,134 @@ app.post('/api/generate-test', requireAuth, async (req, res) => {
 });
 
 // ======================================================================
-// 📝 ROUTE 2: MULTIMODAL SUBJECTIVE EVALUATION GATEWAY
-// (UNCHANGED)
+// 📝 ROUTE 2: MULTIMODAL SUBJECTIVE EVALUATION GATEWAY — BATCH MODE
+// Accepts an ARRAY of subjective questions for one attempt and evaluates
+// ALL of them in a SINGLE Gemini call, instead of one call per question.
+// This matters because a submit with N Subjective questions used to fire
+// N sequential Gemini calls — expensive, slow, and hard to rate-limit
+// sanely (a burst of legitimate calls looks identical to abuse). Batching
+// collapses that to 1 call per chunk (max 10 questions per chunk — see
+// BATCH_SIZE_LIMIT below; the frontend chunks larger sets the same way
+// AiTests.jsx already chunks build-test into groups of 15).
+//
+// Images: rather than sending base64 inline (which bloats the request and
+// gains nothing extra from Gemini, since cost is token-based either way),
+// each image is referenced via a short-lived signed URL from the private
+// 'subjective-uploads' Storage bucket, passed to Gemini as a fileData
+// part with a fileUri. Gemini fetches it directly — no base64 needed.
+//
+// Idempotency: the whole attempt is locked by attemptId while processing,
+// so a double-submit or network retry can't trigger a second (paid-for)
+// Gemini evaluation for work that's already in flight.
 // ======================================================================
-app.post('/api/evaluate-subjective', requireAuth, async (req, res) => {
+const BATCH_SIZE_LIMIT = 10;
+
+app.post('/api/evaluate-subjective', requireAuth, rateLimitEvaluateSubjective, async (req, res) => {
+  const studentId = req.verifiedUserId; // ✅ server-verified
+  const { attemptId, testTitle, questions } = req.body;
+
+  if (!attemptId) {
+    return res.status(400).json({ success: false, error: "attemptId is required." });
+  }
+  if (!Array.isArray(questions) || questions.length === 0) {
+    return res.status(400).json({ success: false, error: "questions must be a non-empty array." });
+  }
+  if (questions.length > BATCH_SIZE_LIMIT) {
+    return res.status(400).json({ success: false, error: `Max ${BATCH_SIZE_LIMIT} questions per batch — please chunk larger sets.` });
+  }
+
+  // 🔒 Idempotency lock — reject if this exact attempt is already being evaluated.
+  if (processingAttempts.has(attemptId)) {
+    return res.status(409).json({ success: false, error: "This attempt is already being evaluated — please wait." });
+  }
+  processingAttempts.add(attemptId);
+
   try {
-    const studentId = req.verifiedUserId; // ✅ server-verified
-    const { question, userAnswer, uploadedFiles, testTitle, maxMarks, questionId } = req.body;
-
-    if (!question) {
-      return res.status(400).json({ success: false, error: "Question metadata reference is missing!" });
-    }
-
     const evaluationModel = genAI.getGenerativeModel({
       model: "gemini-3.1-flash-lite",
       generationConfig: { responseMimeType: "application/json" }
     });
 
-    const parsedMaxMarks = parseFloat(maxMarks) || 10.0;
     const computedTestTitle = testTitle || "Descriptive Assessment Challenge";
 
-    const evaluationPrompt = `
+    // For each question, resolve any uploaded image's storage path into a
+    // short-lived signed URL (bucket is private — Gemini needs a URL it
+    // can actually fetch, not the bare path). Ownership isn't re-checked
+    // here since these paths were written under this same student's own
+    // {user_id}/... prefix at upload time moments earlier in this same
+    // submit flow.
+    const questionsWithSignedUrls = await Promise.all(questions.map(async (q) => {
+      let signedImageUrls = [];
+      if (Array.isArray(q.uploadedFiles)) {
+        const results = await Promise.all(q.uploadedFiles.map(async (file) => {
+          if (!file.path) return null;
+          try {
+            const { data, error } = await supabase.storage
+              .from('subjective-uploads')
+              .createSignedUrl(file.path, 60 * 5); // 5 minutes — plenty for immediate evaluation
+            if (error || !data?.signedUrl) return null;
+            return { url: data.signedUrl, mimeType: file.type || 'image/jpeg' };
+          } catch {
+            return null;
+          }
+        }));
+        signedImageUrls = results.filter(Boolean);
+      }
+      return { ...q, signedImageUrls };
+    }));
+
+    const parsedQuestionsBlock = questionsWithSignedUrls.map((q, idx) => `
+      --- Question ${idx + 1} (questionId: "${q.questionId}") ---
+      Question Statement: "${q.question}"
+      Maximum Marks: ${parseFloat(q.maxMarks) || 10.0}
+      Student Text Answer: "${q.userAnswer || "None provided"}"
+      ${q.signedImageUrls.length > 0 ? `(A handwritten answer image for this question follows below, in the same order.)` : `(No image provided for this question — evaluate from text answer alone.)`}
+    `).join('\n');
+
+    const batchEvaluationPrompt = `
       You are an elite, highly critical senior examiner executing rigorous assessments for Project Infinity.
-      Your goal is to inspect the student's handwritten answer sheets (provided as images) and supplementary text notes against the given question text.
-      
-      [CRITICAL CONTEXT ANALYSIS MATRIX]
-      - Target Test Context Name: "${computedTestTitle}"
-      - Target Question Statement: "${question}"
-      - Maximum Possible Marks Allotted: ${parsedMaxMarks}
-      - Student Supplementary Text Input: "${userAnswer || "None provided"}"
+      Test Context: "${computedTestTitle}"
 
-      [EVALUATION RULES & STANDARDS GATEWAY]
-      1. DYNAMIC CONTEXT ADAPTATION: You must adapt your grading severity instantly to the exam level implied by the test title:
-         - Civil Services (e.g., UPSC, State PSC): Look for multi-dimensional analysis, administrative alignment, and logical flow. Highly academic grading.
-         - Secondary School Boards (e.g., CBSE, ICSE, Class 10/12): Look strictly for exact textual definitions, crucial key terms, and textbook points compliance.
-         - Other Exams (e.g., SSC, Descriptive Banking, Technical): Prioritize precise factual accuracy, structural formatting, and to-the-point answers.
-      2. EXTREME STRICTNESS MODE: Do not award marks casually. Be exceptionally stringent. Deduct fractional points for poor structuring, vague concepts, or missing references. 
-      3. SCALE-PROPORTIONAL SCORING: Provide a strict numeric 'score_given' that scales precisely between 0 and ${parsedMaxMarks}.
-      4. COMPACT NO-FLUFF OUTPUT: Do not give general commentary or essays. Provide a concise points summary and crisp constructive feedback matching the target schema.
+      Below are ${questionsWithSignedUrls.length} separate subjective questions from the SAME test attempt.
+      Evaluate EACH ONE independently — do not let one question's content influence another's score.
 
-      [OUTPUT EXPECTED SCHEMA MAPPING]
-      Return exclusively a JSON object matching this exact architectural structure:
+      [EVALUATION RULES]
+      1. DYNAMIC CONTEXT ADAPTATION: adapt grading severity to the exam level implied by the test title:
+         - Civil Services (UPSC, State PSC): multi-dimensional analysis, administrative alignment, logical flow.
+         - Secondary School Boards (CBSE/ICSE): exact textual definitions, key terms, textbook compliance.
+         - Other exams (SSC, Banking, Technical): factual accuracy, structure, to-the-point answers.
+      2. EXTREME STRICTNESS: do not award marks casually. Deduct for poor structuring, vague concepts, missing references.
+      3. SCALE-PROPORTIONAL SCORING: score_given must scale precisely between 0 and each question's own max marks.
+      4. STRICT WORD LIMITS (critical — batch responses must stay compact):
+         - "student_points": MAXIMUM 2 bullet points, each 15-20 words max.
+         - "scope_of_improvement": ONE sentence, 40-50 words max.
+         - Do not exceed these limits under any circumstance, even for a poor or blank answer.
+
+      [QUESTIONS]
+      ${parsedQuestionsBlock}
+
+      [OUTPUT SCHEMA — RETURN EXACTLY THIS STRUCTURE, ONE ENTRY PER QUESTION, SAME ORDER]
       {
-        "score_given": 0.0,
-        "ai_evaluation": {
-          "student_points": [
-            "Point 1 summarizing accurately a concept the student managed to cover based on the image text analysis.",
-            "Point 2 highlighting another specific key provision or keyword noted in the handwritten draft."
-          ],
-          "scope_of_improvement": "A mid-length concise review detailing exactly what critical criteria was missing or how to format this answer better to secure full marks."
-        }
+        "evaluations": [
+          {
+            "questionId": "<the exact questionId string given above>",
+            "score_given": 0.0,
+            "ai_evaluation": {
+              "student_points": ["point 1 (max 20 words)", "point 2 (max 20 words)"],
+              "scope_of_improvement": "max 50 words"
+            }
+          }
+        ]
       }
     `;
 
-    const generativePayloadParts = [evaluationPrompt];
-    
-    if (uploadedFiles && Array.isArray(uploadedFiles)) {
-      uploadedFiles.forEach(file => {
-        if (file.url && file.url.startsWith('data:')) {
-          const mappedPart = makeGenerativePart(file.url);
-          if (mappedPart) generativePayloadParts.push(mappedPart);
-        }
-      });
+    const generativePayloadParts = [batchEvaluationPrompt];
+    for (const q of questionsWithSignedUrls) {
+      for (const img of q.signedImageUrls) {
+        generativePayloadParts.push({
+          fileData: { fileUri: img.url, mimeType: img.mimeType }
+        });
+      }
     }
 
     let retries = 3;
@@ -314,14 +432,14 @@ app.post('/api/evaluate-subjective', requireAuth, async (req, res) => {
 
     while (retries > 0) {
       try {
-        console.log(`🔍 Initializing Extreme Strict Evaluation via Gemini Multimodal Vision Layer...`);
+        console.log(`🔍 Batch-evaluating ${questionsWithSignedUrls.length} subjective questions for attempt ${attemptId}...`);
         const result = await evaluationModel.generateContent(generativePayloadParts);
         const finalResponse = await result.response;
         evaluationResultText = finalResponse.text();
         break;
       } catch (err) {
         retries--;
-        console.warn(`⚠️ High demand server spike hit subjective evaluator. Retrying batch pipeline...`);
+        console.warn(`⚠️ Batch subjective evaluator hit an error. Retrying...`);
         if (retries === 0) throw err;
         await new Promise(resolve => setTimeout(resolve, 2000));
       }
@@ -329,63 +447,65 @@ app.post('/api/evaluate-subjective', requireAuth, async (req, res) => {
 
     const startBrace = evaluationResultText.indexOf('{');
     const endBrace = evaluationResultText.lastIndexOf('}');
-    if (startBrace === -1 || endBrace === -1) throw new Error("Evaluation Engine failed to output a reliable structured matrix response.");
+    if (startBrace === -1 || endBrace === -1) throw new Error("Evaluation engine failed to output a reliable structured response.");
 
-    const finalEvaluatedPayload = JSON.parse(evaluationResultText.substring(startBrace, endBrace + 1));
-    
-    // 🚨 6. STRICT SCORE VALIDATION & BOUNDARY CLAMP SECURITY GATEWAY
-    let scoreGiven = parseFloat(finalEvaluatedPayload.score_given);
-    if (isNaN(scoreGiven)) scoreGiven = 0.0;
-    scoreGiven = Math.min(parsedMaxMarks, Math.max(0.0, scoreGiven)); // Hard clamp validation fence
+    const finalPayload = JSON.parse(evaluationResultText.substring(startBrace, endBrace + 1));
+    const rawEvaluations = Array.isArray(finalPayload.evaluations) ? finalPayload.evaluations : [];
 
-    console.log(`✅ Subjective Evaluation Complete! Core Score Compiled: ${scoreGiven}/${parsedMaxMarks}`);
+    // Map back onto the ORIGINAL question list by questionId, so a missing
+    // or malformed entry for one question doesn't break the whole batch —
+    // it just falls back to a 0-score placeholder for that one question.
+    const evaluationsById = new Map(rawEvaluations.map(e => [String(e.questionId), e]));
 
-    // 🎯 POOL LEDGER UPDATE (optional — only when this question came from the
-    // shared question pool). Subjective questions don't have a strict
-    // right/wrong answer, so "correct" for resurfacing purposes is defined
-    // as scoring at least 30% of the max marks. Below that, the question
-    // stays eligible to resurface (mirrors wrong-answer resurfacing for MCQs).
-    if (studentId && questionId) {
+    const finalResults = questionsWithSignedUrls.map((q) => {
+      const evalEntry = evaluationsById.get(String(q.questionId));
+      const maxMarks = parseFloat(q.maxMarks) || 10.0;
+      let scoreGiven = parseFloat(evalEntry?.score_given);
+      if (isNaN(scoreGiven)) scoreGiven = 0.0;
+      scoreGiven = Math.min(maxMarks, Math.max(0.0, scoreGiven));
+
+      return {
+        questionId: q.questionId,
+        score_given: scoreGiven,
+        ai_evaluation: {
+          student_points: evalEntry?.ai_evaluation?.student_points || ["Points evaluated contextually."],
+          scope_of_improvement: evalEntry?.ai_evaluation?.scope_of_improvement || "Refine structure and completeness."
+        }
+      };
+    });
+
+    // 🎯 POOL LEDGER UPDATE — best-effort, per question, non-blocking.
+    for (const r of finalResults) {
+      const originalQ = questionsWithSignedUrls.find(q => q.questionId === r.questionId);
+      const maxMarks = parseFloat(originalQ?.maxMarks) || 10.0;
       try {
         const passThreshold = 0.3;
-        const isCorrect = parsedMaxMarks > 0 ? (scoreGiven / parsedMaxMarks) >= passThreshold : false;
-
+        const isCorrect = maxMarks > 0 ? (r.score_given / maxMarks) >= passThreshold : false;
         await supabase
           .from('attempts_ledger')
           .upsert(
-            {
-              student_id: studentId,
-              question_id: questionId,
-              is_correct: isCorrect,
-              attempted_at: new Date().toISOString()
-            },
+            { student_id: studentId, question_id: r.questionId, is_correct: isCorrect, attempted_at: new Date().toISOString() },
             { onConflict: 'student_id,question_id' }
           );
       } catch (ledgerErr) {
-        // Never let ledger bookkeeping block the student from getting their score back.
         console.error("⚠️ Subjective ledger update failed (non-blocking):", ledgerErr);
       }
     }
 
-    res.json({
-      success: true,
-      evaluation: {
-        score_given: scoreGiven,
-        ai_evaluation: {
-          student_points: finalEvaluatedPayload.ai_evaluation?.student_points || ["Points evaluated contextually."],
-          scope_of_improvement: finalEvaluatedPayload.ai_evaluation?.scope_of_improvement || "Refine formatting matrices layouts."
-        }
-      }
-    });
+    console.log(`✅ Batch evaluation complete for attempt ${attemptId}: ${finalResults.length} questions scored.`);
+    res.json({ success: true, evaluations: finalResults });
 
   } catch (error) {
-    console.error("❌ Subjective Evaluator Pipeline Error:", error);
+    console.error("❌ Batch Subjective Evaluator Error:", error);
     res.status(500).json({
       success: false,
-      error: error.message || "An error locked up the subjective processing module matrix."
+      error: error.message || "An error occurred during batch subjective evaluation."
     });
+  } finally {
+    processingAttempts.delete(attemptId);
   }
 });
+
 
 // ======================================================================
 // 🧠 HELPER: Simple word-overlap similarity check (Similarity Safety Net)
@@ -966,7 +1086,7 @@ app.post('/api/pool/toggle-save', requireAuth, async (req, res) => {
 // (server-side only) so grading has something to check against.
 // Supports both Objective and Subjective question types.
 // ======================================================================
-app.post('/api/pool/build-test', requireAuth, async (req, res) => {
+app.post('/api/pool/build-test', requireAuth, rateLimitBuildTest, async (req, res) => {
   try {
     const studentId = req.verifiedUserId; // ✅ server-verified
     const { exam, subject, topic, difficulty, type, count, language, origin, revealAnswers, skipResurfacing, excludeIds } = req.body;
