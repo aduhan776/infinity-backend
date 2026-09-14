@@ -1078,6 +1078,226 @@ app.post('/api/pool/toggle-save', requireAuth, async (req, res) => {
 });
 
 // ======================================================================
+// 🎯 ROUTE (NEW): DEDUCT A BRAINFEED CREDIT (called at load time, not at
+// completion). Called once when a fresh 15-question batch loads, and
+// again if the student uses "Load More" (max 2 calls per user-facing
+// session, since Load More is capped at one use). Deducting at load time
+// — rather than at completion — means a credit is spent the moment the
+// questions are served, so a student can't dodge the charge by closing
+// the tab before finishing. Each call is its own independent ledger row,
+// even though multiple calls can share the same sessionUUID as their
+// reference (both point to the same logical session).
+// ======================================================================
+app.post('/api/brainfeed/deduct-credit', requireAuth, async (req, res) => {
+  try {
+    const studentId = req.verifiedUserId; // ✅ server-verified
+    const { sessionUUID, exam, subjectSection, subject } = req.body;
+
+    if (!sessionUUID) {
+      return res.status(400).json({ success: false, error: "sessionUUID is required." });
+    }
+
+    const sessionLabel = [exam, subjectSection, subject].filter(Boolean).length > 0
+      ? `${exam || 'BrainFeed'} — ${subjectSection || ''}${subject ? ': ' + subject : ''}`.trim()
+      : 'BrainFeed Session';
+
+    const { data: profile, error: profileReadErr } = await supabase
+      .from('profiles')
+      .select('brainfeed_credits')
+      .eq('id', studentId)
+      .single();
+
+    if (profileReadErr) throw profileReadErr;
+
+    const oldCredits = profile?.brainfeed_credits || 0;
+    const newCredits = oldCredits - 1; // tracked only — not enforced/blocked yet, can go negative for now
+
+    const { error: ledgerErr } = await supabase
+      .from('credit_transactions')
+      .insert({
+        user_id: studentId,
+        feature: 'brainfeed',
+        type: 'consumption',
+        amount: -1,
+        balance_after: newCredits,
+        reference: sessionUUID,
+        session_label: sessionLabel
+      });
+
+    if (ledgerErr) throw ledgerErr;
+
+    const { error: profileUpdateErr } = await supabase
+      .from('profiles')
+      .update({ brainfeed_credits: newCredits })
+      .eq('id', studentId);
+
+    if (profileUpdateErr) throw profileUpdateErr;
+
+    res.json({ success: true, updatedBrainfeedCredits: newCredits });
+
+  } catch (error) {
+    console.error("❌ Deduct BrainFeed Credit Error:", error);
+    res.status(500).json({ success: false, error: error.message || "Failed to deduct credit." });
+  }
+});
+
+// ======================================================================
+// 🎯 ROUTE (NEW): SAVE / UPDATE A BRAINFEED SESSION'S DATA
+// No credit logic here anymore (moved to /deduct-credit above, which runs
+// at load time). This route just persists the session content:
+//   - attempts_ledger upserts (submit-attempt) are completely untouched
+//     and keep happening exactly as before, per-question, unrelated to this.
+//   - question_ids + answers only — correct answers/explanations are
+//     re-fetched from question_pool at revise-time (AnalysisPortal pattern).
+//   - Updates the existing cumulative brainfeed_count/brainfeed_accuracy
+//     columns on profiles (same aggregation math as before).
+// INSERT-OR-UPDATE: the row's id is the client-generated sessionUUID
+// (the same one used for the credit deduction reference above), not an
+// auto-generated id. This lets "Save and Exit" create a partial row, and
+// later completing that same session (after "Continue Session") update
+// that same row instead of creating a duplicate.
+// ======================================================================
+app.post('/api/brainfeed/complete-session', requireAuth, async (req, res) => {
+  try {
+    const studentId = req.verifiedUserId; // ✅ server-verified
+    const { sessionUUID, questionIds, answers, attempted, correct } = req.body;
+
+    if (!sessionUUID) {
+      return res.status(400).json({ success: false, error: "sessionUUID is required." });
+    }
+    if (!Array.isArray(questionIds) || !Array.isArray(answers)) {
+      return res.status(400).json({ success: false, error: "questionIds and answers arrays are required." });
+    }
+    if (typeof attempted !== 'number' || typeof correct !== 'number') {
+      return res.status(400).json({ success: false, error: "attempted and correct counts are required." });
+    }
+    if (attempted === 0) {
+      return res.status(400).json({ success: false, error: "Nothing was attempted in this session." });
+    }
+
+    const sessionAccuracy = Math.round((correct / attempted) * 100);
+
+    // Insert-or-update keyed on the client-generated sessionUUID.
+    // upsert() with an explicit id handles both "first save" (Save and Exit,
+    // or a direct finish) and "second save" (finishing after a resume)
+    // without us needing to check existence first.
+    const { data: sessionRow, error: sessionErr } = await supabase
+      .from('brainfeed_sessions')
+      .upsert({
+        id: sessionUUID,
+        user_id: studentId,
+        question_ids: questionIds,
+        answers: answers,
+        score: correct,
+        accuracy: sessionAccuracy
+      })
+      .select()
+      .single();
+
+    if (sessionErr) throw sessionErr;
+
+    // Cumulative stats update — same math as before, just no credit changes here.
+    // NOTE: this still adds `attempted` on every save call. If a session is
+    // saved once via "Save and Exit" (partial) and then saved again after
+    // being completed, the completed save's `attempted`/`correct` reflect the
+    // FULL session (not just the delta), so the caller must ensure attempted/
+    // correct passed here represent the session's current total, not an
+    // increment — the frontend recomputes these fresh each time from
+    // selectedAnswers/answerResults, so this holds true.
+    const { data: profile, error: profileReadErr } = await supabase
+      .from('profiles')
+      .select('brainfeed_count, brainfeed_accuracy')
+      .eq('id', studentId)
+      .single();
+
+    if (profileReadErr) throw profileReadErr;
+
+    const oldAttempted = profile?.brainfeed_count || 0;
+    const oldAccuracy = profile?.brainfeed_accuracy || 0;
+    const oldCorrect = Math.round((oldAccuracy / 100) * oldAttempted);
+    const newTotalQuestions = oldAttempted + attempted;
+    const newTotalCorrect = oldCorrect + correct;
+    const newOverallAccuracy = newTotalQuestions > 0 ? Math.round((newTotalCorrect / newTotalQuestions) * 100) : 0;
+
+    const { error: profileUpdateErr } = await supabase
+      .from('profiles')
+      .update({
+        brainfeed_count: newTotalQuestions,
+        brainfeed_accuracy: newOverallAccuracy
+      })
+      .eq('id', studentId);
+
+    if (profileUpdateErr) throw profileUpdateErr;
+
+    res.json({
+      success: true,
+      sessionId: sessionRow.id,
+      metricsSummary: {
+        sessionAccuracy,
+        beforeAccuracy: oldAccuracy,
+        newAccuracy: newOverallAccuracy,
+        attempted,
+        correct
+      }
+    });
+
+  } catch (error) {
+    console.error("❌ Complete BrainFeed Session Error:", error);
+    res.status(500).json({ success: false, error: error.message || "Failed to save session." });
+  }
+});
+
+// ======================================================================
+// 🎯 ROUTE (NEW): BRAINFEED HISTORY — list past sessions + current credits
+// Used by the "Revise Previous Sessions" card. Returns lightweight
+// metadata only (no question content) so the list loads fast; full
+// question data is fetched separately when the user opens a specific
+// session to revise, via /api/pool/questions-by-ids (already exists).
+// ======================================================================
+app.get('/api/brainfeed/history', requireAuth, async (req, res) => {
+  try {
+    const studentId = req.verifiedUserId; // ✅ server-verified
+
+    const { data: sessions, error: sessionsErr } = await supabase
+      .from('brainfeed_sessions')
+      .select('id, question_ids, answers, score, accuracy, created_at')
+      .eq('user_id', studentId)
+      .order('created_at', { ascending: false })
+      .limit(50);
+
+    if (sessionsErr) throw sessionsErr;
+
+    const { data: profile, error: profileErr } = await supabase
+      .from('profiles')
+      .select('brainfeed_credits')
+      .eq('id', studentId)
+      .single();
+
+    if (profileErr) throw profileErr;
+
+    const formattedSessions = (sessions || []).map(s => ({
+      id: s.id,
+      questionCount: Array.isArray(s.question_ids) ? s.question_ids.length : 0,
+      questionIdsRaw: s.question_ids || [],
+      answersRaw: s.answers || [],
+      score: s.score,
+      accuracy: s.accuracy,
+      createdAt: s.created_at
+    }));
+
+    res.json({
+      success: true,
+      sessions: formattedSessions,
+      brainfeedCredits: profile?.brainfeed_credits || 0
+    });
+
+  } catch (error) {
+    console.error("❌ BrainFeed History Error:", error);
+    res.status(500).json({ success: false, error: error.message || "Failed to fetch history." });
+  }
+});
+
+// ======================================================================
 // 🎯 ROUTE 6: BUILD A FULL TEST PAPER FROM THE POOL (with AI fallback)
 // Used by AI Labs. As of "Secure Test Delivery", this route strips
 // answers from its response just like /api/pool/serve-questions —
@@ -1359,6 +1579,57 @@ app.post('/api/pool/questions-by-ids', requireAuth, async (req, res) => {
 
   } catch (error) {
     console.error("❌ Questions-By-Ids Fetch Error:", error);
+    res.status(500).json({ success: false, error: error.message || "Failed to fetch question content." });
+  }
+});
+
+// ======================================================================
+// 🎯 ROUTE (NEW): BRAINFEED QUESTIONS-BY-IDS (for Revise Previous Sessions)
+// Same ownership-checked pattern as /api/pool/questions-by-ids above, but
+// checks brainfeed_sessions instead of test_sessions — the two are kept
+// as separate routes on purpose so the existing AI Labs route above stays
+// completely untouched.
+// ======================================================================
+app.post('/api/brainfeed/questions-by-ids', requireAuth, async (req, res) => {
+  try {
+    const studentId = req.verifiedUserId; // ✅ server-verified
+    const { sessionId, questionIds } = req.body;
+
+    if (!sessionId || !Array.isArray(questionIds) || questionIds.length === 0) {
+      return res.status(400).json({ success: false, error: "sessionId and a non-empty questionIds array are required." });
+    }
+
+    // Ownership check — this BrainFeed session must belong to the verified student.
+    const { data: sessionRow, error: sessionErr } = await supabase
+      .from('brainfeed_sessions')
+      .select('id, user_id, question_ids')
+      .eq('id', sessionId)
+      .eq('user_id', studentId)
+      .single();
+
+    if (sessionErr || !sessionRow) {
+      return res.status(403).json({ success: false, error: "This session does not belong to you, or could not be found." });
+    }
+
+    // Only ever fetch ids that are actually part of this owned session.
+    const ownedIds = new Set((sessionRow.question_ids || []).map(String));
+    const safeIds = questionIds.filter(id => ownedIds.has(String(id)));
+
+    if (safeIds.length === 0) {
+      return res.json({ success: true, questions: [] });
+    }
+
+    const { data: poolRows, error: poolErr } = await supabase
+      .from('question_pool')
+      .select('*')
+      .in('id', safeIds);
+
+    if (poolErr) throw poolErr;
+
+    res.json({ success: true, questions: poolRows || [] });
+
+  } catch (error) {
+    console.error("❌ BrainFeed Questions-By-Ids Fetch Error:", error);
     res.status(500).json({ success: false, error: error.message || "Failed to fetch question content." });
   }
 });
