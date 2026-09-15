@@ -1566,6 +1566,21 @@ app.post('/api/pool/build-test', requireAuth, rateLimitBuildTest, async (req, re
 
   } catch (error) {
     console.error("❌ Build Test Error:", error);
+
+    // Gemini returns 503/429 when the model is overloaded or we're being rate
+    // limited on their side. That's temporary and not the student's fault, so
+    // send back something they can actually act on instead of the raw SDK error.
+    const rawMessage = error?.message || '';
+    const isUpstreamBusy = rawMessage.includes('503') || rawMessage.includes('Service Unavailable') || rawMessage.includes('overloaded') || rawMessage.includes('high demand') || rawMessage.includes('429');
+
+    if (isUpstreamBusy) {
+      return res.status(503).json({
+        success: false,
+        upstreamBusy: true,
+        error: "Our question generator is under heavy load right now. Please try again in a few minutes."
+      });
+    }
+
     res.status(500).json({ success: false, error: error.message || "Failed to build test from pool." });
   }
 });
