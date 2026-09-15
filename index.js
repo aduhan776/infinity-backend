@@ -1399,6 +1399,19 @@ app.get('/api/brainfeed/history', requireAuth, async (req, res) => {
 // ======================================================================
 app.post('/api/pool/build-test', requireAuth, rateLimitBuildTest, async (req, res) => {
   try {
+    // 🧪 TEST SWITCH: set FORCE_UPSTREAM_BUSY=true in the environment to make
+    // this route always respond as if the question generator were overloaded.
+    // Used to verify the client's "Server Is Busy" flow (and that no credit is
+    // charged) without waiting for a real upstream outage. Remove the env var
+    // to go back to normal behaviour.
+    if (process.env.FORCE_UPSTREAM_BUSY === 'true') {
+      return res.status(503).json({
+        success: false,
+        upstreamBusy: true,
+        error: "The server is busy right now. Please try again in a little while."
+      });
+    }
+
     const studentId = req.verifiedUserId; // ✅ server-verified
     const { exam, subject, topic, difficulty, type, count, language, origin, revealAnswers, skipResurfacing, excludeIds } = req.body;
 
