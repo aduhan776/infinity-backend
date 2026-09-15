@@ -1088,6 +1088,16 @@ app.post('/api/pool/toggle-save', requireAuth, async (req, res) => {
 // even though multiple calls can share the same sessionUUID as their
 // reference (both point to the same logical session).
 // ======================================================================
+// Shared helper: builds the same human-readable session label used both when
+// a credit is deducted (credit_transactions.session_label) and when the
+// session's own data is saved (brainfeed_sessions.session_label) — kept as
+// one function so the two labels for the same session never drift apart.
+function buildBrainfeedSessionLabel(exam, subjectSection, subject) {
+  return [exam, subjectSection, subject].filter(Boolean).length > 0
+    ? `${exam || 'BrainFeed'} — ${subjectSection || ''}${subject ? ': ' + subject : ''}`.trim()
+    : 'BrainFeed Session';
+}
+
 app.post('/api/brainfeed/deduct-credit', requireAuth, async (req, res) => {
   try {
     const studentId = req.verifiedUserId; // ✅ server-verified
@@ -1097,9 +1107,7 @@ app.post('/api/brainfeed/deduct-credit', requireAuth, async (req, res) => {
       return res.status(400).json({ success: false, error: "sessionUUID is required." });
     }
 
-    const sessionLabel = [exam, subjectSection, subject].filter(Boolean).length > 0
-      ? `${exam || 'BrainFeed'} — ${subjectSection || ''}${subject ? ': ' + subject : ''}`.trim()
-      : 'BrainFeed Session';
+    const sessionLabel = buildBrainfeedSessionLabel(exam, subjectSection, subject);
 
     const { data: profile, error: profileReadErr } = await supabase
       .from('profiles')
@@ -1160,7 +1168,7 @@ app.post('/api/brainfeed/deduct-credit', requireAuth, async (req, res) => {
 app.post('/api/brainfeed/complete-session', requireAuth, async (req, res) => {
   try {
     const studentId = req.verifiedUserId; // ✅ server-verified
-    const { sessionUUID, questionIds, answers, attempted, correct } = req.body;
+    const { sessionUUID, questionIds, answers, attempted, correct, isCompleted, exam, subjectSection, subject } = req.body;
 
     if (!sessionUUID) {
       return res.status(400).json({ success: false, error: "sessionUUID is required." });
@@ -1176,6 +1184,24 @@ app.post('/api/brainfeed/complete-session', requireAuth, async (req, res) => {
     }
 
     const sessionAccuracy = Math.round((correct / attempted) * 100);
+    const sessionLabel = buildBrainfeedSessionLabel(exam, subjectSection, subject);
+
+    // 🐛 FIX: if this session was already partially saved once (e.g. "Save and
+    // Exit"), profiles.brainfeed_count/accuracy already counted that partial
+    // attempt. Completing the same session later must apply only the DELTA
+    // (attempted - previouslyAttempted), not the full new total again, or
+    // those earlier questions get double-counted into the cumulative stats.
+    const { data: existingSession } = await supabase
+      .from('brainfeed_sessions')
+      .select('score, answers')
+      .eq('id', sessionUUID)
+      .eq('user_id', studentId)
+      .maybeSingle();
+
+    const previouslyAttempted = existingSession
+      ? (existingSession.answers || []).filter(a => a !== null && a !== undefined).length
+      : 0;
+    const previouslyCorrect = existingSession ? (existingSession.score || 0) : 0;
 
     // Insert-or-update keyed on the client-generated sessionUUID.
     // upsert() with an explicit id handles both "first save" (Save and Exit,
@@ -1189,21 +1215,21 @@ app.post('/api/brainfeed/complete-session', requireAuth, async (req, res) => {
         question_ids: questionIds,
         answers: answers,
         score: correct,
-        accuracy: sessionAccuracy
+        accuracy: sessionAccuracy,
+        is_completed: !!isCompleted,
+        session_label: sessionLabel
       })
       .select()
       .single();
 
     if (sessionErr) throw sessionErr;
 
-    // Cumulative stats update — same math as before, just no credit changes here.
-    // NOTE: this still adds `attempted` on every save call. If a session is
-    // saved once via "Save and Exit" (partial) and then saved again after
-    // being completed, the completed save's `attempted`/`correct` reflect the
-    // FULL session (not just the delta), so the caller must ensure attempted/
-    // correct passed here represent the session's current total, not an
-    // increment — the frontend recomputes these fresh each time from
-    // selectedAnswers/answerResults, so this holds true.
+    // Cumulative stats update — now uses only the DELTA since the last save
+    // of this same session, so a partial "Save and Exit" followed later by
+    // a full completion doesn't double-count the questions from the first save.
+    const deltaAttempted = Math.max(0, attempted - previouslyAttempted);
+    const deltaCorrect = Math.max(0, correct - previouslyCorrect);
+
     const { data: profile, error: profileReadErr } = await supabase
       .from('profiles')
       .select('brainfeed_count, brainfeed_accuracy')
@@ -1215,8 +1241,8 @@ app.post('/api/brainfeed/complete-session', requireAuth, async (req, res) => {
     const oldAttempted = profile?.brainfeed_count || 0;
     const oldAccuracy = profile?.brainfeed_accuracy || 0;
     const oldCorrect = Math.round((oldAccuracy / 100) * oldAttempted);
-    const newTotalQuestions = oldAttempted + attempted;
-    const newTotalCorrect = oldCorrect + correct;
+    const newTotalQuestions = oldAttempted + deltaAttempted;
+    const newTotalCorrect = oldCorrect + deltaCorrect;
     const newOverallAccuracy = newTotalQuestions > 0 ? Math.round((newTotalCorrect / newTotalQuestions) * 100) : 0;
 
     const { error: profileUpdateErr } = await supabase
@@ -1248,6 +1274,69 @@ app.post('/api/brainfeed/complete-session', requireAuth, async (req, res) => {
 });
 
 // ======================================================================
+// 🎯 ROUTE (NEW): BEST-EFFORT SESSION SAVE VIA sendBeacon
+// navigator.sendBeacon() cannot set custom headers (no Authorization
+// header), so this route accepts the Supabase access token inside the
+// JSON body instead and verifies it manually — same underlying check
+// requireAuth does (supabase.auth.getUser(token)), just not as middleware.
+// This exists purely so a tab close / app backgrounding mid-session can
+// fire a save that actually has a chance of completing before the page
+// is torn down (sendBeacon is designed to survive that, unlike fetch).
+// Saves as incomplete (is_completed: false) — a genuine finish always
+// goes through the normal /complete-session call above.
+// ======================================================================
+app.post('/api/brainfeed/beacon-save', async (req, res) => {
+  try {
+    const { accessToken, sessionUUID, questionIds, answers, attempted, correct, exam, subjectSection, subject } = req.body || {};
+
+    if (!accessToken) {
+      return res.status(401).json({ success: false, error: "Missing access token." });
+    }
+
+    const { data: authData, error: authErr } = await supabase.auth.getUser(accessToken);
+    if (authErr || !authData?.user) {
+      return res.status(401).json({ success: false, error: "Invalid or expired session." });
+    }
+    const studentId = authData.user.id; // ✅ server-verified, same as requireAuth
+
+    if (!sessionUUID || !Array.isArray(questionIds) || !Array.isArray(answers)) {
+      return res.status(400).json({ success: false, error: "sessionUUID, questionIds, and answers are required." });
+    }
+    if (typeof attempted !== 'number' || attempted === 0) {
+      // Nothing was answered yet — nothing meaningful to save. Not an error,
+      // just a no-op (e.g. the tab closed before the first answer was picked).
+      return res.json({ success: true, skipped: true });
+    }
+
+    const safeCorrect = typeof correct === 'number' ? correct : 0;
+    const sessionAccuracy = Math.round((safeCorrect / attempted) * 100);
+    const sessionLabel = buildBrainfeedSessionLabel(exam, subjectSection, subject);
+
+    const { error: sessionErr } = await supabase
+      .from('brainfeed_sessions')
+      .upsert({
+        id: sessionUUID,
+        user_id: studentId,
+        question_ids: questionIds,
+        answers: answers,
+        score: safeCorrect,
+        accuracy: sessionAccuracy,
+        is_completed: false,
+        session_label: sessionLabel
+      });
+
+    if (sessionErr) throw sessionErr;
+
+    res.json({ success: true });
+
+  } catch (error) {
+    console.error("❌ Beacon Save Error:", error);
+    // sendBeacon doesn't read the response anyway, but keep this consistent.
+    res.status(500).json({ success: false, error: error.message || "Beacon save failed." });
+  }
+});
+
+// ======================================================================
 // 🎯 ROUTE (NEW): BRAINFEED HISTORY — list past sessions + current credits
 // Used by the "Revise Previous Sessions" card. Returns lightweight
 // metadata only (no question content) so the list loads fast; full
@@ -1260,7 +1349,7 @@ app.get('/api/brainfeed/history', requireAuth, async (req, res) => {
 
     const { data: sessions, error: sessionsErr } = await supabase
       .from('brainfeed_sessions')
-      .select('id, question_ids, answers, score, accuracy, created_at')
+      .select('id, question_ids, answers, score, accuracy, created_at, is_completed, session_label')
       .eq('user_id', studentId)
       .order('created_at', { ascending: false })
       .limit(50);
@@ -1282,7 +1371,9 @@ app.get('/api/brainfeed/history', requireAuth, async (req, res) => {
       answersRaw: s.answers || [],
       score: s.score,
       accuracy: s.accuracy,
-      createdAt: s.created_at
+      createdAt: s.created_at,
+      isCompleted: !!s.is_completed,
+      sessionLabel: s.session_label || 'BrainFeed Session'
     }));
 
     res.json({
