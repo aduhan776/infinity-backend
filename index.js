@@ -1357,6 +1357,26 @@ app.post('/api/brainfeed/beacon-save', async (req, res) => {
 // ======================================================================
 
 const QR_TOKEN_TTL_MS = 3 * 60 * 1000; // 3 minutes
+
+// Tokens closed early by "Finish Uploading" on either device. The token
+// itself is self-contained (nothing to revoke in a table), so ending a
+// session before its expiry needs this small in-memory note — the same
+// approach the double-submit guard uses. Entries are dropped once the
+// token would have expired anyway, so this can't grow unbounded.
+const closedQrTokens = new Map(); // token -> expiry timestamp
+
+function closeQrToken(token, expiresAt) {
+  closedQrTokens.set(token, expiresAt);
+  // Opportunistic cleanup of anything already past its natural expiry.
+  const now = Date.now();
+  for (const [t, exp] of closedQrTokens) {
+    if (exp < now) closedQrTokens.delete(t);
+  }
+}
+
+function isQrTokenClosed(token) {
+  return closedQrTokens.has(token);
+}
 const QR_TOKEN_SECRET = process.env.QR_TOKEN_SECRET || process.env.SUPABASE_SERVICE_ROLE_KEY;
 
 function base64UrlEncode(str) {
@@ -1395,6 +1415,8 @@ function verifyQrToken(token) {
     const payload = JSON.parse(base64UrlDecode(payloadStr));
     if (!payload?.u || !payload?.a || payload.q === undefined || !payload?.e) return null;
     if (Date.now() > payload.e) return null;
+    // Finished early from either device — treat exactly like expired.
+    if (isQrTokenClosed(token)) return null;
 
     return payload;
   } catch {
@@ -1445,6 +1467,27 @@ app.post('/api/qr/verify', async (req, res) => {
 });
 
 // ---------------------------------------------------------------
+// Either device: end the session now rather than waiting out the clock.
+// Pressing "Finish Uploading" on the phone should close the window on the
+// desktop and vice versa, so both sides call this and both sides notice
+// within one poll. No auth needed — holding the token is what proves you
+// were part of this session, and closing it can only ever end your own.
+// ---------------------------------------------------------------
+app.post('/api/qr/close', async (req, res) => {
+  const token = req.body?.token;
+  const payload = verifyQrToken(token);
+
+  // Already expired or already closed — nothing left to do, and from the
+  // caller's point of view the outcome is the same.
+  if (!payload) {
+    return res.json({ success: true, alreadyClosed: true });
+  }
+
+  closeQrToken(token, payload.e);
+  res.json({ success: true });
+});
+
+// ---------------------------------------------------------------
 // Phone: get a one-shot signed URL and upload straight to Storage.
 // ---------------------------------------------------------------
 app.post('/api/qr/signed-upload', async (req, res) => {
@@ -1478,11 +1521,15 @@ app.post('/api/qr/signed-upload', async (req, res) => {
 app.post('/api/qr/list', requireAuth, async (req, res) => {
   try {
     const studentId = req.verifiedUserId; // ✅ server-verified
-    const { attemptId, questionIndex } = req.body;
+    const { attemptId, questionIndex, token } = req.body;
 
     if (!attemptId || questionIndex === undefined || questionIndex === null) {
       return res.status(400).json({ success: false, error: "attemptId and questionIndex are required." });
     }
+
+    // If the phone pressed "Finish Uploading", the desktop learns about it
+    // here, on its next poll, and closes its own window to match.
+    const sessionEnded = token ? !verifyQrToken(token) : false;
 
     const folder = qrFolderPath(studentId, attemptId);
     const { data: entries, error } = await supabase.storage
@@ -1492,7 +1539,7 @@ app.post('/api/qr/list', requireAuth, async (req, res) => {
     // An empty folder reads back as an error on some storage versions —
     // treat "nothing there yet" as simply no files rather than a failure.
     if (error) {
-      return res.json({ success: true, files: [] });
+      return res.json({ success: true, files: [], sessionEnded });
     }
 
     const prefix = `${questionIndex}_`;
@@ -1511,7 +1558,7 @@ app.post('/api/qr/list', requireAuth, async (req, res) => {
       };
     }));
 
-    res.json({ success: true, files });
+    res.json({ success: true, files, sessionEnded });
 
   } catch (error) {
     console.error("❌ QR List Error:", error);
