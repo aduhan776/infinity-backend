@@ -1337,6 +1337,201 @@ app.post('/api/brainfeed/beacon-save', async (req, res) => {
 });
 
 // ======================================================================
+// 🎯 ROUTE (NEW): COMBINED CREDIT BALANCES
+// One place for every feature's balance, so each page doesn't need its own
+// endpoint (and the future recharge screen can read both at once).
+// ======================================================================
+app.get('/api/credits', requireAuth, async (req, res) => {
+  try {
+    const studentId = req.verifiedUserId; // ✅ server-verified
+
+    const { data: profile, error } = await supabase
+      .from('profiles')
+      .select('brainfeed_credits, ai_labs_credits')
+      .eq('id', studentId)
+      .single();
+
+    if (error) throw error;
+
+    res.json({
+      success: true,
+      brainfeedCredits: profile?.brainfeed_credits || 0,
+      aiLabsCredits: profile?.ai_labs_credits || 0
+    });
+
+  } catch (error) {
+    console.error("❌ Credits Fetch Error:", error);
+    res.status(500).json({ success: false, error: error.message || "Failed to fetch credits." });
+  }
+});
+
+// ======================================================================
+// 🎯 ROUTE (NEW): DEDUCT AI LABS CREDITS
+// AI Labs bills per QUESTION (BrainFeed bills per 15-question session —
+// different units, separate balance columns, so the two never interfere).
+//   1 Objective question  = 1 credit
+//   1 Subjective question = 2 credits  (generation + image evaluation +
+//                                       feedback costs roughly double)
+// Called only AFTER a generation run fully succeeds, so a failed or
+// partially-failed run never costs the student anything. The counts come
+// from the questions that were actually produced, not what was requested.
+// ======================================================================
+app.post('/api/ailabs/deduct-credit', requireAuth, async (req, res) => {
+  try {
+    const studentId = req.verifiedUserId; // ✅ server-verified
+    const { testId, testTitle, objectiveCount, subjectiveCount } = req.body;
+
+    const objCount = Number(objectiveCount) || 0;
+    const subCount = Number(subjectiveCount) || 0;
+
+    if (!testId) {
+      return res.status(400).json({ success: false, error: "testId is required." });
+    }
+    if (objCount === 0 && subCount === 0) {
+      return res.status(400).json({ success: false, error: "Nothing was generated — nothing to charge for." });
+    }
+
+    const totalCost = (objCount * 1) + (subCount * 2);
+
+    const { data: profile, error: profileReadErr } = await supabase
+      .from('profiles')
+      .select('ai_labs_credits')
+      .eq('id', studentId)
+      .single();
+
+    if (profileReadErr) throw profileReadErr;
+
+    const oldCredits = profile?.ai_labs_credits || 0;
+    const newCredits = oldCredits - totalCost; // tracked only — not enforced/blocked yet
+
+    const { error: ledgerErr } = await supabase
+      .from('credit_transactions')
+      .insert({
+        user_id: studentId,
+        feature: 'ai_labs',
+        type: 'consumption',
+        amount: -totalCost,
+        balance_after: newCredits,
+        reference: testId,
+        session_label: testTitle || 'AI Labs Test'
+      });
+
+    if (ledgerErr) throw ledgerErr;
+
+    const { error: profileUpdateErr } = await supabase
+      .from('profiles')
+      .update({ ai_labs_credits: newCredits })
+      .eq('id', studentId);
+
+    if (profileUpdateErr) throw profileUpdateErr;
+
+    res.json({ success: true, updatedAiLabsCredits: newCredits, charged: totalCost });
+
+  } catch (error) {
+    console.error("❌ Deduct AI Labs Credit Error:", error);
+    res.status(500).json({ success: false, error: error.message || "Failed to deduct credits." });
+  }
+});
+
+// ======================================================================
+// 🎯 ROUTE (NEW): SAVE A GENERATED AI LABS TEST
+// Generated tests used to live only in IndexedDB, which meant a test built
+// on one device couldn't be opened on another, and a generated-but-never-
+// attempted test left the credit ledger's `reference` pointing at nothing.
+// This stores the full structure (timing, marks, section layout, question
+// types) so the test can be reconstructed anywhere, and can be re-attempted.
+// It deliberately lives in its OWN table rather than test_sessions: that
+// table is read by Library, Statistics, Dashboard, Profile, TestSeries and
+// AnalysisPortal as a list of *attempts*, so dropping never-attempted rows
+// into it would corrupt every one of those counts and listings.
+// ======================================================================
+app.post('/api/ailabs/save-generated-test', requireAuth, async (req, res) => {
+  try {
+    const studentId = req.verifiedUserId; // ✅ server-verified
+    const { testId, title, questionIds, testStructure } = req.body;
+
+    if (!testId || !testStructure) {
+      return res.status(400).json({ success: false, error: "testId and testStructure are required." });
+    }
+
+    const { error } = await supabase
+      .from('ai_generated_tests')
+      .upsert({
+        id: testId,
+        user_id: studentId,
+        title: title || 'AI Labs Test',
+        question_ids: questionIds || [],
+        test_structure: testStructure,
+        is_attempted: false
+      });
+
+    if (error) throw error;
+
+    res.json({ success: true });
+
+  } catch (error) {
+    console.error("❌ Save Generated Test Error:", error);
+    res.status(500).json({ success: false, error: error.message || "Failed to save generated test." });
+  }
+});
+
+// ======================================================================
+// 🎯 ROUTE (NEW): MARK A GENERATED TEST AS ATTEMPTED
+// Called by TestPortal right after a successful attempt submission, so the
+// "tests you generated but haven't taken yet" list stays accurate.
+// ======================================================================
+app.post('/api/ailabs/mark-attempted', requireAuth, async (req, res) => {
+  try {
+    const studentId = req.verifiedUserId; // ✅ server-verified
+    const { testId } = req.body;
+
+    if (!testId) {
+      return res.status(400).json({ success: false, error: "testId is required." });
+    }
+
+    const { error } = await supabase
+      .from('ai_generated_tests')
+      .update({ is_attempted: true })
+      .eq('id', testId)
+      .eq('user_id', studentId);
+
+    if (error) throw error;
+
+    res.json({ success: true });
+
+  } catch (error) {
+    console.error("❌ Mark Attempted Error:", error);
+    res.status(500).json({ success: false, error: error.message || "Failed to mark test as attempted." });
+  }
+});
+
+// ======================================================================
+// 🎯 ROUTE (NEW): LIST GENERATED AI LABS TESTS
+// Backs the future "your generated tests" screen. Returns metadata plus the
+// stored structure, so a test can be reopened on any device.
+// ======================================================================
+app.get('/api/ailabs/generated-tests', requireAuth, async (req, res) => {
+  try {
+    const studentId = req.verifiedUserId; // ✅ server-verified
+
+    const { data, error } = await supabase
+      .from('ai_generated_tests')
+      .select('id, title, question_ids, test_structure, is_attempted, created_at')
+      .eq('user_id', studentId)
+      .order('created_at', { ascending: false })
+      .limit(50);
+
+    if (error) throw error;
+
+    res.json({ success: true, tests: data || [] });
+
+  } catch (error) {
+    console.error("❌ Generated Tests Fetch Error:", error);
+    res.status(500).json({ success: false, error: error.message || "Failed to fetch generated tests." });
+  }
+});
+
+// ======================================================================
 // 🎯 ROUTE (NEW): BRAINFEED HISTORY — list past sessions + current credits
 // Used by the "Revise Previous Sessions" card. Returns lightweight
 // metadata only (no question content) so the list loads fast; full
