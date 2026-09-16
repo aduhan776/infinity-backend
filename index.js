@@ -3,6 +3,7 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import { createClient } from '@supabase/supabase-js';
+import crypto from 'crypto';
 
 dotenv.config();
 
@@ -1333,6 +1334,188 @@ app.post('/api/brainfeed/beacon-save', async (req, res) => {
     console.error("❌ Beacon Save Error:", error);
     // sendBeacon doesn't read the response anyway, but keep this consistent.
     res.status(500).json({ success: false, error: error.message || "Beacon save failed." });
+  }
+});
+
+// ======================================================================
+// 📱 QR PHONE-UPLOAD FLOW
+// Writing a handwritten answer and then getting a photo of it onto a
+// desktop is awkward, so the subjective question panel offers a QR code:
+// scan it with a phone, shoot the answer, and the photo appears on the
+// desktop alongside anything uploaded there directly.
+//
+// The phone is NOT logged in — all it carries is the token from the QR
+// code. That token is a signed string (user id + attempt + question index
+// + expiry, HMAC-signed), so it verifies on its own without any lookup,
+// and no session/upload tables are needed. It's deliberately short-lived:
+// the desktop opens a 3-minute window, and both screens count down the
+// same clock. Expired simply means "reopen the QR" — which also sidesteps
+// any question of how long a test runs or how long it sits paused.
+//
+// Uploads go straight from the phone to Supabase Storage using a signed
+// upload URL, so image bytes never pass through this server.
+// ======================================================================
+
+const QR_TOKEN_TTL_MS = 3 * 60 * 1000; // 3 minutes
+const QR_TOKEN_SECRET = process.env.QR_TOKEN_SECRET || process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+function base64UrlEncode(str) {
+  return Buffer.from(str, 'utf8').toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function base64UrlDecode(str) {
+  const padded = str.replace(/-/g, '+').replace(/_/g, '/');
+  return Buffer.from(padded, 'base64').toString('utf8');
+}
+
+function signQrPayload(payloadStr) {
+  return crypto.createHmac('sha256', QR_TOKEN_SECRET).update(payloadStr).digest('base64')
+    .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function createQrToken({ userId, attemptId, questionIndex, expiresAt }) {
+  const payloadStr = base64UrlEncode(JSON.stringify({ u: userId, a: attemptId, q: questionIndex, e: expiresAt }));
+  return `${payloadStr}.${signQrPayload(payloadStr)}`;
+}
+
+// Returns the decoded payload, or null if the token is malformed, tampered
+// with, or past its expiry.
+function verifyQrToken(token) {
+  try {
+    if (typeof token !== 'string' || !token.includes('.')) return null;
+    const [payloadStr, signature] = token.split('.');
+    if (!payloadStr || !signature) return null;
+
+    const expected = signQrPayload(payloadStr);
+    // Constant-time compare so a wrong token can't be guessed by timing.
+    const sigBuf = Buffer.from(signature);
+    const expBuf = Buffer.from(expected);
+    if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) return null;
+
+    const payload = JSON.parse(base64UrlDecode(payloadStr));
+    if (!payload?.u || !payload?.a || payload.q === undefined || !payload?.e) return null;
+    if (Date.now() > payload.e) return null;
+
+    return payload;
+  } catch {
+    return null;
+  }
+}
+
+// Where a QR-uploaded file lives. Kept in its own `qr/` subfolder so the
+// desktop can list just these without touching the files written at submit
+// time, which use a different naming scheme in the same attempt folder.
+function qrFolderPath(userId, attemptId) {
+  return `${userId}/${attemptId}/qr`;
+}
+
+// ---------------------------------------------------------------
+// Desktop: open a QR window for one question.
+// ---------------------------------------------------------------
+app.post('/api/qr/create-session', requireAuth, async (req, res) => {
+  try {
+    const studentId = req.verifiedUserId; // ✅ server-verified
+    const { attemptId, questionIndex } = req.body;
+
+    if (!attemptId || questionIndex === undefined || questionIndex === null) {
+      return res.status(400).json({ success: false, error: "attemptId and questionIndex are required." });
+    }
+
+    const expiresAt = Date.now() + QR_TOKEN_TTL_MS;
+    const token = createQrToken({ userId: studentId, attemptId, questionIndex, expiresAt });
+
+    res.json({ success: true, token, expiresAt, ttlMs: QR_TOKEN_TTL_MS });
+
+  } catch (error) {
+    console.error("❌ QR Create Session Error:", error);
+    res.status(500).json({ success: false, error: error.message || "Could not open an upload session." });
+  }
+});
+
+// ---------------------------------------------------------------
+// Phone: check the scanned token is still good (public — the token IS
+// the authorisation; there's no logged-in session on this device).
+// ---------------------------------------------------------------
+app.post('/api/qr/verify', async (req, res) => {
+  const payload = verifyQrToken(req.body?.token);
+  if (!payload) {
+    return res.status(401).json({ success: false, expired: true, error: "This upload session has expired. Reopen the QR code on your computer." });
+  }
+  res.json({ success: true, questionIndex: payload.q, expiresAt: payload.e });
+});
+
+// ---------------------------------------------------------------
+// Phone: get a one-shot signed URL and upload straight to Storage.
+// ---------------------------------------------------------------
+app.post('/api/qr/signed-upload', async (req, res) => {
+  try {
+    const { token, fileName, } = req.body || {};
+    const payload = verifyQrToken(token);
+    if (!payload) {
+      return res.status(401).json({ success: false, expired: true, error: "This upload session has expired. Reopen the QR code on your computer." });
+    }
+
+    const safeName = String(fileName || 'photo.jpg').replace(/[^a-zA-Z0-9._-]/g, '_');
+    const path = `${qrFolderPath(payload.u, payload.a)}/${payload.q}_${Date.now()}_${safeName}`;
+
+    const { data, error } = await supabase.storage
+      .from('subjective-uploads')
+      .createSignedUploadUrl(path);
+
+    if (error) throw error;
+
+    res.json({ success: true, path, signedUrl: data.signedUrl, uploadToken: data.token });
+
+  } catch (error) {
+    console.error("❌ QR Signed Upload Error:", error);
+    res.status(500).json({ success: false, error: error.message || "Could not prepare the upload." });
+  }
+});
+
+// ---------------------------------------------------------------
+// Desktop: poll for whatever the phone has sent for this question.
+// ---------------------------------------------------------------
+app.post('/api/qr/list', requireAuth, async (req, res) => {
+  try {
+    const studentId = req.verifiedUserId; // ✅ server-verified
+    const { attemptId, questionIndex } = req.body;
+
+    if (!attemptId || questionIndex === undefined || questionIndex === null) {
+      return res.status(400).json({ success: false, error: "attemptId and questionIndex are required." });
+    }
+
+    const folder = qrFolderPath(studentId, attemptId);
+    const { data: entries, error } = await supabase.storage
+      .from('subjective-uploads')
+      .list(folder, { limit: 100, sortBy: { column: 'created_at', order: 'asc' } });
+
+    // An empty folder reads back as an error on some storage versions —
+    // treat "nothing there yet" as simply no files rather than a failure.
+    if (error) {
+      return res.json({ success: true, files: [] });
+    }
+
+    const prefix = `${questionIndex}_`;
+    const matching = (entries || []).filter(e => e.name && e.name.startsWith(prefix));
+
+    const files = await Promise.all(matching.map(async (entry) => {
+      const path = `${folder}/${entry.name}`;
+      const { data: signed } = await supabase.storage
+        .from('subjective-uploads')
+        .createSignedUrl(path, 600);
+      return {
+        path,
+        name: entry.name.replace(new RegExp(`^${questionIndex}_\\d+_`), ''),
+        mimeType: entry.metadata?.mimetype || 'image/jpeg',
+        url: signed?.signedUrl || null
+      };
+    }));
+
+    res.json({ success: true, files });
+
+  } catch (error) {
+    console.error("❌ QR List Error:", error);
+    res.status(500).json({ success: false, error: error.message || "Could not check for uploads." });
   }
 });
 
