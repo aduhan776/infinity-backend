@@ -1837,6 +1837,149 @@ app.get('/api/ailabs/generated-tests/:testId', requireAuth, async (req, res) => 
 });
 
 // ======================================================================
+// 🎯 ROUTE (NEW): SAVE / UPDATE A PAUSED TEST DRAFT
+// Cloud counterpart to the IndexedDB draft that was already being kept
+// during a test (800ms debounce, local-only, same-device). Called by
+// TestPortal every 20s while a test is in progress, and immediately (not
+// debounced) when the student presses Pause/Save-for-Later — so a draft
+// is resumable from any device, not just the one it was started on.
+// Generic across test types (AI Labs and Test Series both use this same
+// draft flow in the frontend) — named /api/tests/... rather than
+// /api/ailabs/... for that reason, even though it lives near the AI Labs
+// routes below.
+// Upserts on `id` (the test's own id, same row a submit would later use)
+// so repeated calls update the same draft row rather than creating new
+// ones. Ownership is enforced via user_id on every write.
+// ======================================================================
+app.post('/api/tests/save-draft', requireAuth, async (req, res) => {
+  try {
+    const studentId = req.verifiedUserId; // ✅ server-verified
+    const {
+      id, testId, title, timeLeft, rawSeconds, answers, timeTracker,
+      lastIndex, currentSectionIdx, markedForReview, sectionTimeLeft,
+      questionsList, sections, mode, time, questions, hasSectionalTiming
+    } = req.body;
+
+    if (!id || !testId) {
+      return res.status(400).json({ success: false, error: "id and testId are required." });
+    }
+
+    const { error } = await supabase
+      .from('test_sessions')
+      .upsert({
+        id,
+        test_id: testId,
+        user_id: studentId,
+        title: title || 'Untitled Test',
+        status: 'draft',
+        score: 'Drafted',
+        accuracy: 0,
+        time_left: timeLeft,
+        raw_seconds: rawSeconds,
+        answers: answers || {},
+        time_tracker: timeTracker || {},
+        draft_meta: {
+          lastIndex, currentSectionIdx, markedForReview, sectionTimeLeft,
+          questions_list: questionsList, sections, mode, time, questions,
+          hasSectionalTiming
+        }
+      });
+
+    if (error) throw error;
+
+    res.json({ success: true });
+
+  } catch (error) {
+    console.error("❌ Save Draft Error:", error);
+    res.status(500).json({ success: false, error: error.message || "Failed to save draft." });
+  }
+});
+
+// ======================================================================
+// 🎯 ROUTE (NEW): LIST THIS STUDENT'S PAUSED DRAFTS (any test type)
+// Library reads from here now instead of merging in an IndexedDB copy —
+// Supabase is kept current by the periodic/immediate draft saves above,
+// so it's fresh enough to be the only source, and it works from any device.
+// ======================================================================
+app.get('/api/tests/drafts', requireAuth, async (req, res) => {
+  try {
+    const studentId = req.verifiedUserId; // ✅ server-verified
+
+    const { data, error } = await supabase
+      .from('test_sessions')
+      .select('*')
+      .eq('user_id', studentId)
+      .eq('status', 'draft')
+      .order('created_at', { ascending: false });
+
+    if (error) throw error;
+
+    res.json({ success: true, drafts: data || [] });
+
+  } catch (error) {
+    console.error("❌ Drafts Fetch Error:", error);
+    res.status(500).json({ success: false, error: error.message || "Failed to fetch drafts." });
+  }
+});
+
+// ======================================================================
+// 🎯 ROUTE (NEW): DELETE A DRAFT
+// Called on submit (the draft becomes a submitted row instead) and on
+// explicit "discard draft" from Library. Ownership-scoped so a student can
+// only delete their own draft row.
+// ======================================================================
+app.delete('/api/tests/drafts/:draftId', requireAuth, async (req, res) => {
+  try {
+    const studentId = req.verifiedUserId; // ✅ server-verified
+    const { draftId } = req.params;
+
+    const { error } = await supabase
+      .from('test_sessions')
+      .delete()
+      .eq('id', draftId)
+      .eq('user_id', studentId)
+      .eq('status', 'draft'); // never touch a submitted row through this route
+
+    if (error) throw error;
+
+    res.json({ success: true });
+
+  } catch (error) {
+    console.error("❌ Delete Draft Error:", error);
+    res.status(500).json({ success: false, error: error.message || "Failed to delete draft." });
+  }
+});
+
+// ======================================================================
+// 🎯 ROUTE (NEW): DELETE A SUBMITTED TEST-SESSION (attempt history record)
+// Separate from the draft-delete route above on purpose: that route only
+// ever touches status='draft' rows (so a stray call can never wipe a real
+// graded attempt), and this one only ever touches status='submitted' rows,
+// for the same reason in reverse. Used by Library's "delete history record".
+// ======================================================================
+app.delete('/api/tests/history/:attemptId', requireAuth, async (req, res) => {
+  try {
+    const studentId = req.verifiedUserId; // ✅ server-verified
+    const { attemptId } = req.params;
+
+    const { error } = await supabase
+      .from('test_sessions')
+      .delete()
+      .eq('id', attemptId)
+      .eq('user_id', studentId)
+      .eq('status', 'submitted'); // never touch a draft row through this route
+
+    if (error) throw error;
+
+    res.json({ success: true });
+
+  } catch (error) {
+    console.error("❌ Delete History Error:", error);
+    res.status(500).json({ success: false, error: error.message || "Failed to delete history record." });
+  }
+});
+
+// ======================================================================
 // 🎯 ROUTE (NEW): BRAINFEED HISTORY — list past sessions + current credits
 // Used by the "Revise Previous Sessions" card. Returns lightweight
 // metadata only (no question content) so the list loads fast; full
