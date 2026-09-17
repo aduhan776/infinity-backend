@@ -1596,6 +1596,44 @@ app.get('/api/credits', requireAuth, async (req, res) => {
 });
 
 // ======================================================================
+// 🎯 ROUTE (NEW): CAN THIS PAPER BE AFFORDED?
+// AI Labs generates a long paper in batches, and build-test gates each
+// batch on its own cost. That alone would let a student get halfway
+// through a 100-question paper before running out, so the client asks
+// this first with the total for the whole paper — either the entire test
+// is affordable and gets built, or nothing is generated at all.
+// ======================================================================
+app.post('/api/ailabs/check-credits', requireAuth, async (req, res) => {
+  try {
+    const studentId = req.verifiedUserId; // ✅ server-verified
+    const objCount = Number(req.body?.objectiveCount) || 0;
+    const subCount = Number(req.body?.subjectiveCount) || 0;
+    const required = (objCount * 1) + (subCount * 2);
+
+    const { data: profile, error } = await supabase
+      .from('profiles')
+      .select('ai_labs_credits')
+      .eq('id', studentId)
+      .single();
+
+    if (error) throw error;
+
+    const available = profile?.ai_labs_credits || 0;
+
+    res.json({
+      success: true,
+      sufficient: available >= required,
+      available,
+      required
+    });
+
+  } catch (error) {
+    console.error("❌ AI Labs Credit Check Error:", error);
+    res.status(500).json({ success: false, error: error.message || "Could not check your credits." });
+  }
+});
+
+// ======================================================================
 // 🎯 ROUTE (NEW): DEDUCT AI LABS CREDITS
 // AI Labs bills per QUESTION (BrainFeed bills per 15-question session —
 // different units, separate balance columns, so the two never interfere).
@@ -1841,6 +1879,54 @@ app.post('/api/pool/build-test', requireAuth, rateLimitBuildTest, async (req, re
     // sends up to 15 per call (client-side batching loop), so this mainly
     // future-proofs any caller that requests a larger count in one shot.
     const totalRequested = Math.min(200, Math.max(1, rawRequested));
+
+    // 💳 CREDIT GATE — nothing is generated for an account that can't pay for
+    // it. There's no free tier: every account starts with a trial allowance
+    // and must have the balance up front. Checked here rather than on the
+    // client because a client-side check is trivially bypassed.
+    //
+    // The two features bill in different units and from separate balances:
+    // BrainFeed costs one session credit per 15-question batch, while AI Labs
+    // bills per question (Subjective counts double). AI Labs generates in
+    // batches, so each batch is gated on its own cost; the client also checks
+    // the whole paper's cost before starting, so the student is told up front
+    // rather than partway through.
+    const isBrainfeed = origin === 'brainfeed';
+
+    const { data: creditProfile, error: creditErr } = await supabase
+      .from('profiles')
+      .select('brainfeed_credits, ai_labs_credits')
+      .eq('id', studentId)
+      .single();
+
+    if (creditErr) throw creditErr;
+
+    if (isBrainfeed) {
+      const available = creditProfile?.brainfeed_credits || 0;
+      if (available < 1) {
+        return res.status(402).json({
+          success: false,
+          insufficientCredits: true,
+          feature: 'brainfeed',
+          available,
+          required: 1,
+          error: "You're out of BrainFeed sessions. Add more to keep practising."
+        });
+      }
+    } else {
+      const available = creditProfile?.ai_labs_credits || 0;
+      const required = totalRequested * (qType === 'Subjective' ? 2 : 1);
+      if (available < required) {
+        return res.status(402).json({
+          success: false,
+          insufficientCredits: true,
+          feature: 'ai_labs',
+          available,
+          required,
+          error: "You don't have enough question credits in AI Labs for this test."
+        });
+      }
+    }
 
     // 🚨 excludeIds: question_pool row IDs already served earlier in THIS
     // SAME generation session (e.g. AI Labs' batching loop calls build-test
