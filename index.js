@@ -1800,6 +1800,43 @@ app.get('/api/ailabs/generated-tests', requireAuth, async (req, res) => {
 });
 
 // ======================================================================
+// 🎯 ROUTE (NEW): FETCH ONE GENERATED AI LABS TEST BY ID
+// Supabase is now the ONLY place an AI Labs test's structure lives (IndexedDB
+// was removed — it couldn't survive a different device/browser, or even the
+// same browser if the local store hadn't been created there yet). TestPortal
+// calls this on any direct URL / reload of an AI-FULL-*/AI-TOPIC-* test id.
+// Scoped to the owning user_id so one student can't load another's test by
+// guessing an id.
+// ======================================================================
+app.get('/api/ailabs/generated-tests/:testId', requireAuth, async (req, res) => {
+  try {
+    const studentId = req.verifiedUserId; // ✅ server-verified
+    const { testId } = req.params;
+
+    if (!testId) {
+      return res.status(400).json({ success: false, error: "testId is required." });
+    }
+
+    const { data, error } = await supabase
+      .from('ai_generated_tests')
+      .select('id, title, question_ids, test_structure, is_attempted, created_at')
+      .eq('id', testId)
+      .eq('user_id', studentId)
+      .single();
+
+    if (error || !data) {
+      return res.status(404).json({ success: false, error: "This AI test was not found, or does not belong to you." });
+    }
+
+    res.json({ success: true, test: data });
+
+  } catch (error) {
+    console.error("❌ Single Generated Test Fetch Error:", error);
+    res.status(500).json({ success: false, error: error.message || "Failed to fetch the generated test." });
+  }
+});
+
+// ======================================================================
 // 🎯 ROUTE (NEW): BRAINFEED HISTORY — list past sessions + current credits
 // Used by the "Revise Previous Sessions" card. Returns lightweight
 // metadata only (no question content) so the list loads fast; full
