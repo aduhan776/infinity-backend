@@ -1923,6 +1923,41 @@ app.get('/api/tests/drafts', requireAuth, async (req, res) => {
 });
 
 // ======================================================================
+// 🎯 ROUTE (NEW): FETCH ONE DRAFT BY ITS TEST ID
+// Used by TestPortal on reload/direct-URL when IndexedDB doesn't have this
+// device's copy (a different device, or IndexedDB was cleared) — the
+// fallback path to /api/tests/drafts above, which lists all of them.
+// Matches on test_id (the id the URL and IndexedDB both key by), not the
+// row's own primary key. Ownership-scoped: only this student's own draft.
+// ======================================================================
+app.get('/api/tests/drafts/by-test/:testId', requireAuth, async (req, res) => {
+  try {
+    const studentId = req.verifiedUserId; // ✅ server-verified
+    const { testId } = req.params;
+
+    const { data, error } = await supabase
+      .from('test_sessions')
+      .select('*')
+      .eq('test_id', testId)
+      .eq('user_id', studentId)
+      .eq('status', 'draft')
+      .maybeSingle();
+
+    if (error) throw error;
+
+    if (!data) {
+      return res.status(404).json({ success: false, error: "No draft found for this test." });
+    }
+
+    res.json({ success: true, draft: data });
+
+  } catch (error) {
+    console.error("❌ Single Draft Fetch Error:", error);
+    res.status(500).json({ success: false, error: error.message || "Failed to fetch the draft." });
+  }
+});
+
+// ======================================================================
 // 🎯 ROUTE (NEW): DELETE A DRAFT
 // Called on submit (the draft becomes a submitted row instead) and on
 // explicit "discard draft" from Library. Ownership-scoped so a student can
