@@ -1263,6 +1263,14 @@ app.post('/api/brainfeed/complete-session', requireAuth, async (req, res) => {
         sessionAccuracy,
         beforeAccuracy: oldAccuracy,
         newAccuracy: newOverallAccuracy,
+        // 🆕 newTotalQuestions — the new lifetime brainfeed_count, mirroring
+        // newAccuracy above. Added so the frontend's shared UserDataContext
+        // can update its cached brainfeed_count locally right after a
+        // session completes, instead of only Dashboard/Statistics picking
+        // up the new value on their next independent fetch (which, now
+        // that they read from shared context instead of fetching on every
+        // visit, could otherwise mean a stale count until a reload).
+        newTotalQuestions,
         attempted,
         correct
       }
