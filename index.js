@@ -2733,4 +2733,57 @@ app.get('/api/tests/load', async (req, res) => {
   }
 });
 
+// ======================================================================
+// 🎯 ROUTE 11 (NEW): TEST RANKINGS — Test Series mock tests only.
+// Not applicable to AI Labs tests, since those are generated per-user and
+// aren't a shared test other students also attempt.
+//
+// Ranking is by each student's BEST score across all their attempts on
+// this test (combined, not per-attempt-number) — confirmed decision.
+//
+// Auth-gated (requireAuth) because this reveals other students' names —
+// the ONLY place in this app where one user's data is shown to another,
+// so it must never be reachable without a verified session. The actual
+// cross-user read happens inside get_test_rankings(), a SECURITY DEFINER
+// Postgres function whose EXECUTE privilege has been explicitly revoked
+// from both anon and authenticated (verified via get_advisors) — so this
+// backend route, using the service-role client, is the ONLY door into it.
+//
+// Response is intentionally narrow: only full_name + best_score per
+// student for the top10 list, and rank/total_students for the caller's
+// own standing. No user_id, no other profile fields, ever leave this route.
+// ======================================================================
+app.get('/api/tests/rankings', requireAuth, async (req, res) => {
+  try {
+    const { testId } = req.query;
+    if (!testId) return res.status(400).json({ success: false, error: "testId missing bhai!" });
+
+    const { data, error } = await supabase.rpc('get_test_rankings', { p_test_id: testId });
+    if (error) throw error;
+
+    const rankings = data || [];
+
+    // top10: name + score only, nothing else.
+    const top10 = rankings.slice(0, 10).map(row => ({
+      full_name: row.full_name,
+      best_score: row.best_score,
+    }));
+
+    // Find the calling (server-verified) user's own row, if they've
+    // attempted this test at all. If they haven't, yourRank is null —
+    // frontend should handle that as "you haven't attempted this test yet"
+    // rather than showing a broken rank.
+    const ownRow = rankings.find(row => row.user_id === req.verifiedUserId);
+    const yourRank = ownRow
+      ? { rank: ownRow.rank, total_students: ownRow.total_students, best_score: ownRow.best_score }
+      : null;
+
+    res.json({ success: true, top10, yourRank });
+
+  } catch (error) {
+    console.error("❌ Test Rankings Error:", error);
+    res.status(500).json({ success: false, error: error.message || "Failed to load rankings." });
+  }
+});
+
 app.listen(PORT, () => console.log(`🔥 Production Secure Server running active on port: ${PORT}`));
